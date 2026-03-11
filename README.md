@@ -2,9 +2,11 @@
 
 
 A unified Windows application for managing video wallpapers with online discovery, smooth transitions, and global keyboard shortcuts.
+
  Python 
-
-
+ 
+<img width="1914" height="1071" alt="Screenshot 2026-03-11 212042" src="https://github.com/user-attachments/assets/959823df-a384-4904-8fd3-29a59218de51" />
+<img width="1914" height="1071" alt="Screenshot 2026-03-11 211951" src="https://github.com/user-attachments/assets/810cabd0-6512-4af2-a517-317138537510" />
 
  Platform 
 ✨ Features
@@ -112,6 +114,7 @@ pynput (optional, for keyboard shortcuts)
 
 🤝 Contributing
 Contributions are welcome! Please feel free to submit a Pull Request.
+
 📝 License
 This project is licensed under the MIT License - see the LICENSE file for details.
 
@@ -121,3 +124,5 @@ MPV for the video playback engine
 
 
 Made with ❤️ by Raniel
+
+buymeacoffee.com/avraniel                
