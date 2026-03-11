@@ -3,7 +3,6 @@
 
 A unified Windows application for managing video wallpapers with online discovery, smooth transitions, and global keyboard shortcuts.
 
- Python 
  
 <img width="1914" height="1071" alt="Screenshot 2026-03-11 212042" src="https://github.com/user-attachments/assets/959823df-a384-4904-8fd3-29a59218de51" />
 <img width="1914" height="1071" alt="Screenshot 2026-03-11 211951" src="https://github.com/user-attachments/assets/810cabd0-6512-4af2-a517-317138537510" />
