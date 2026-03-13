@@ -4,7 +4,9 @@ Video Wallpaper Manager - Theme Engine + Visualizer Customization
 - Added 'Rainbow Mode' for visualizer.
 - Added 'Bar Width' setting.
 - Styles: Bars, Slim, Wave, Wave Dots, Radial.
-- Added Keyboard Shortcuts UI
+- Added Keyboard Shortcuts with UI
+- Fixed Windows Taskbar Icon
+- Fixed Random Wallpaper functionality
 """
 import sys
 import os
@@ -595,7 +597,7 @@ def get_monitor_geometry(monitor_idx=None):
     min_y = min(m['y'] for m in state.monitors)
     max_x = max(m['x'] + m['width'] for m in state.monitors)
     max_y = max(m['y'] + m['height'] for m in state.monitors)
-    return (min_x, min_y, max_x - min_x, max_y - min_y)
+    return (min_x, min_y, max_x - min_x, max_y - max_y)
 
 def launch_mpv(video, x, y, width, height):
     geometry = f"{width}x{height}+{x}+{y}"
@@ -735,23 +737,35 @@ def crossfade_monitor(monitor_idx, new_video_idx):
             state.transition_active = False
 
 def start_wallpaper(video=None):
+    """Start wallpaper on all monitors"""
     stop_wallpapers()
     if not state.videos:
+        state.log("No videos in library", "WARNING")
         return
+    
+    # If video is None, use current_index
+    if video is None:
+        video = state.videos[state.current_index]
+    
     if state.current_mode == "span":
-        video = video or state.videos[state.current_index]
         x, y, w, h = get_monitor_geometry()
         p = launch_mpv(video, x, y, w, h)
         hwnd, p = setup_wallpaper_window(p, 0)
         if hwnd:
             state.processes = {0: [p]}
+            state.log(f"Started wallpaper: {os.path.basename(video)}")
     else:
+        # Individual or duplicate mode
         for i in range(len(state.monitors)):
             video_idx = state.current_index
             if state.current_mode == "individual":
                 video_idx = state.monitor_assignments.get(i, i) % len(state.videos)
-            instant_switch_monitor(i, video_idx)
-            time.sleep(0.2)
+                video_to_use = state.videos[video_idx]
+            else:  # duplicate mode
+                video_to_use = video
+                
+            threading.Thread(target=instant_switch_monitor, args=(i, video_idx if state.current_mode == "individual" else state.current_index), daemon=True).start()
+            time.sleep(0.2)  # Small delay to prevent conflicts
 
 def next_wallpaper():
     if not state.videos:
@@ -778,10 +792,33 @@ def prev_wallpaper():
         start_wallpaper()
 
 def random_wallpaper():
+    """Set a random wallpaper from the library"""
     if not state.videos:
+        state.log("No videos in library to set random wallpaper", "WARNING")
+        # Show message to user if QApplication exists
+        try:
+            QMessageBox.information(None, "No Videos", "Please add videos to the library first")
+        except:
+            pass
         return
-    state.current_index = random.randint(0, len(state.videos) - 1)
-    start_wallpaper()
+    
+    # Generate random index
+    new_index = random.randint(0, len(state.videos) - 1)
+    state.current_index = new_index
+    video_name = os.path.basename(state.videos[new_index])
+    state.log(f"Setting random wallpaper: {video_name}")
+    
+    if state.current_mode == "individual":
+        # For individual mode, set all monitors to the same random video
+        for i in range(len(state.monitors)):
+            state.monitor_assignments[i] = new_index
+            # Use threading for smooth transitions
+            threading.Thread(target=crossfade_monitor, args=(i, new_index), daemon=True).start()
+    else:
+        # For span or duplicate mode
+        stop_wallpapers()  # Clean stop before starting new
+        time.sleep(0.1)    # Brief pause
+        start_wallpaper(state.videos[new_index])
 
 # ==================== CONFIG & DATA ====================
 def load_config():
@@ -1227,7 +1264,7 @@ class DisplayTab(QWidget):
             vis_layout.addWidget(err_label)
         layout.addWidget(vis_box)
 
-        # Keyboard Shortcuts (NEW)
+        # Keyboard Shortcuts
         shortcut_box = QGroupBox("Keyboard Shortcuts")
         shortcut_layout = QVBoxLayout(shortcut_box)
 
@@ -1471,8 +1508,8 @@ class MainWindow(QMainWindow):
                 state.log("pynput not available - keyboard shortcuts disabled")
 
         # System Tray
-        tray_icon = QSystemTrayIcon(self)
-        tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
         tray_menu = QMenu()
         next_action = QAction("Next Wallpaper", self)
         next_action.triggered.connect(next_wallpaper)
@@ -1499,8 +1536,8 @@ class MainWindow(QMainWindow):
         quit_action = QAction("Quit", self)
         quit_action.triggered.connect(QApplication.instance().quit)
         tray_menu.addAction(quit_action)
-        tray_icon.setContextMenu(tray_menu)
-        tray_icon.show()
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
 
     def toggle_visualizer_tray(self):
         is_enabled = not state.visualizer_enabled
@@ -1547,9 +1584,59 @@ class MainWindow(QMainWindow):
             theme_engine.set_theme(theme_name)
 
 if __name__ == "__main__":
+    # Get the correct path for both script and exe
+    if getattr(sys, 'frozen', False):
+        # Running as compiled executable
+        application_path = os.path.dirname(sys.executable)
+        # Set a more specific AppUserModelID
+        myappid = 'VideoWallpaperManager.MainApp.1.0'
+    else:
+        # Running as script
+        application_path = os.path.dirname(os.path.abspath(__file__))
+        myappid = 'com.videowallpaper.app.script.1.0'
+    
+    # Set Windows App User Model ID (important for taskbar icon)
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
+    except Exception as e:
+        print(f"Failed to set AppUserModelID: {e}")
+
     app = QApplication(sys.argv)
+
+    # Load icon with multiple fallback methods
+    icon = QIcon()
+    
+    # Try loading from various possible locations
+    icon_paths = [
+        os.path.join(application_path, 'icon.ico'),
+        os.path.join(application_path, 'resources', 'icon.ico'),
+        os.path.join(os.path.dirname(application_path), 'icon.ico'),
+        os.path.join(os.getcwd(), 'icon.ico'),
+    ]
+    
+    for icon_path in icon_paths:
+        if os.path.exists(icon_path):
+            icon = QIcon(icon_path)
+            app.setWindowIcon(icon)
+            print(f"Loaded icon from: {icon_path}")
+            break
+    
+    # If no icon found, create a default one
+    if icon.isNull():
+        print("No icon file found, using default icon")
+        # Create a simple colored icon as fallback
+        pixmap = QPixmap(64, 64)
+        pixmap.fill(QColor('#00d4aa'))
+        icon = QIcon(pixmap)
+        app.setWindowIcon(icon)
+
+    # Initialize Theme Engine
     theme_engine = ThemeManager(app)
     theme_engine.set_theme(state.theme)
+
     window = MainWindow()
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
+    
     sys.exit(app.exec())
