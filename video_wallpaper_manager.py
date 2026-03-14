@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
-Video Wallpaper Manager - Theme Engine + Visualizer Customization
-- Added 'Rainbow Mode' for visualizer.
-- Added 'Bar Width' setting.
-- Styles: Bars, Slim, Wave, Wave Dots, Radial.
-- Added Keyboard Shortcuts with UI
-- Fixed Windows Taskbar Icon
-- Fixed Random Wallpaper functionality
+Video Wallpaper Manager - Complete Fixed Version
+- Fixed auto-change timer
+- Fixed tab references
+- Added proper thread-safe signals
+- Improved logging and debugging
 """
 import sys
 import os
@@ -19,79 +17,114 @@ import random
 import ctypes
 import ctypes.wintypes
 import atexit
-import struct
-import math
+import signal
+import psutil
+import shutil
 from datetime import datetime
 from collections import deque
-from urllib.parse import quote, urljoin
+from urllib.parse import quote
 from io import BytesIO
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLineEdit, QPushButton, QListWidgetItem, QLabel,
-    QMessageBox, QTabWidget, QComboBox, QSlider, QCheckBox,
-    QGroupBox, QGridLayout, QSpinBox, QSystemTrayIcon, QMenu,
-    QProgressBar, QTextEdit, QFileDialog, QFrame,
-    QScrollArea, QRadioButton, QButtonGroup, QStyle,
-    QKeySequenceEdit, QListWidget, QSizePolicy
+    QLineEdit, QPushButton, QLabel, QMessageBox, QTabWidget, 
+    QComboBox, QSlider, QCheckBox, QGroupBox, QGridLayout, 
+    QSpinBox, QSystemTrayIcon, QMenu, QProgressBar, QFileDialog, 
+    QFrame, QScrollArea, QRadioButton, QButtonGroup, QStyle,
+    QListWidget
 )
-from PyQt6.QtGui import (
-    QPixmap, QFont, QIcon, QAction, QImage, QPainter, QBrush,
-    QColor, QPen, QPolygonF, QPalette, QPainterPath
-)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSize, QObject, QPointF
+from PyQt6.QtGui import QPixmap, QIcon, QAction, QColor
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PIL import Image
 from bs4 import BeautifulSoup
 import win32gui
 import win32con
 import win32process
+import win32api
 from screeninfo import get_monitors
 
-# Audio Vis Dependencies
-try:
-    import pyaudiowpatch as pyaudio
-    import numpy as np
-    AUDIO_VIS_AVAILABLE = True
-except ImportError:
-    AUDIO_VIS_AVAILABLE = False
-    print("Audio Visualizer dependencies not found. Install: pip install pyaudiowpatch numpy")
+# ==================== PATH CONFIGURATION ====================
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+DEFAULT_VIDEO_PATH = os.path.join(os.path.expanduser("~"), "Videos", "wallpapers")
 
-# Keyboard shortcut support
-try:
-    from pynput import keyboard
-    PYNPUT_AVAILABLE = True
-except ImportError:
-    PYNPUT_AVAILABLE = False
+def load_settings():
+    """Load settings from JSON file"""
+    default_settings = {
+        "video_path": DEFAULT_VIDEO_PATH,
+        "library_paths": [],
+        "check_subfolders": False
+    }
+    
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                settings = json.load(f)
+                for key in default_settings:
+                    if key not in settings:
+                        settings[key] = default_settings[key]
+                return settings
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Error loading settings: {e}")
+            return default_settings
+    return default_settings
+
+def save_settings(settings):
+    """Save settings to JSON file"""
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+        return False
+
+def get_video_path():
+    """Get the video storage path from settings"""
+    settings = load_settings()
+    path = settings.get("video_path", DEFAULT_VIDEO_PATH)
+    
+    if not os.path.exists(path):
+        try:
+            os.makedirs(path)
+        except Exception as e:
+            print(f"Error creating video directory: {e}")
+            path = DEFAULT_VIDEO_PATH
+            if not os.path.exists(path):
+                os.makedirs(path, exist_ok=True)
+    
+    return path
+
+def get_config_file():
+    """Get the configuration file path"""
+    return os.path.join(get_video_path(), "config.json")
+
+def get_log_file():
+    """Get the log file path"""
+    return os.path.join(get_video_path(), "wallpaper.log")
+
+# Set global paths
+SAVE_DIR = get_video_path()
+CONFIG_FILE = get_config_file()
+LOG_FILE = get_log_file()
 
 # ==================== CONFIGURATION ====================
 BASE_URL = "https://moewalls.com"
-SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpapers")
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
-LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "wallpaper.log")
 VIDEO_EXTENSIONS = (".mp4", ".webm", ".mkv")
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+MAX_RETRIES = 3
+RETRY_DELAY = 1
+PROCESS_CLEANUP_TIMEOUT = 3
+PROCESS_HEALTH_CHECK_INTERVAL = 5
 
 DEFAULT_SETTINGS = {
     "mode": "individual",
     "transition_duration": 1.2,
     "transition_fps": 60,
     "auto_change_enabled": False,
-    "auto_change_interval": 300,
+    "auto_change_interval": 300,  # seconds
     "monitor_assignments": {},
-    "shortcuts_enabled": True,
-    "shortcuts": {
-        "next": "<ctrl>+<shift>+n",
-        "prev": "<ctrl>+<shift>+p",
-        "random": "<ctrl>+<shift>+r",
-        "toggle": "<ctrl>+<shift>+t"
-    },
     "theme": "Dark",
     "accent_color": "#00d4aa",
-    "visualizer_enabled": False,
-    "visualizer_style": "Radial",
-    "visualizer_bars": 64,
-    "visualizer_height": 100,
-    "visualizer_rainbow": False,
-    "visualizer_bar_width": 3
+    "library_paths": []
 }
 
 # Windows constants
@@ -104,745 +137,266 @@ SW_HIDE = 0
 SW_SHOW = 5
 SetLayeredWindowAttributes = ctypes.windll.user32.SetLayeredWindowAttributes
 
-# ==================== THEME ENGINE ====================
-class ThemeManager:
-    THEMES = {
-        "Dark": {
-            "name": "Dark", "window": "#1e1e1e", "base": "#252525", "alt_base": "#2d2d2d",
-            "text": "#ffffff", "text_disabled": "#a0a0a0", "accent": "#00d4aa", "accent_hover": "#00ffcc",
-            "selection": "#00d4aa", "border": "#3d3d3d", "input_bg": "#2d2d2d",
-            "scrollbar_bg": "#2d2d2d", "scrollbar_handle": "#555555",
-        },
-        "Light": {
-            "name": "Light", "window": "#f0f0f0", "base": "#ffffff", "alt_base": "#f8f8f8",
-            "text": "#1e1e1e", "text_disabled": "#888888", "accent": "#0078d4", "accent_hover": "#1084d8",
-            "selection": "#0078d4", "border": "#d0d0d0", "input_bg": "#ffffff",
-            "scrollbar_bg": "#f0f0f0", "scrollbar_handle": "#c0c0c0",
-        },
-        "Dracula": {
-            "name": "Dracula", "window": "#282a36", "base": "#44475a", "alt_base": "#44475a",
-            "text": "#f8f8f2", "text_disabled": "#6272a4", "accent": "#bd93f9", "accent_hover": "#ff79c6",
-            "selection": "#bd93f9", "border": "#6272a4", "input_bg": "#44475a",
-            "scrollbar_bg": "#282a36", "scrollbar_handle": "#6272a4",
-        },
-        "Nord": {
-            "name": "Nord", "window": "#2e3440", "base": "#3b4252", "alt_base": "#434c5e",
-            "text": "#eceff4", "text_disabled": "#d8dee9", "accent": "#88c0d0", "accent_hover": "#81a1c1",
-            "selection": "#5e81ac", "border": "#4c566a", "input_bg": "#3b4252",
-            "scrollbar_bg": "#2e3440", "scrollbar_handle": "#4c566a",
-        },
-        "Midnight": {
-            "name": "Midnight", "window": "#0a0a0a", "base": "#121212", "alt_base": "#1e1e1e",
-            "text": "#e0e0e0", "text_disabled": "#606060", "accent": "#bb86fc", "accent_hover": "#cf9fff",
-            "selection": "#bb86fc", "border": "#2e2e2e", "input_bg": "#1e1e1e",
-            "scrollbar_bg": "#121212", "scrollbar_handle": "#333333",
-        }
-    }
-
-    def __init__(self, app):
-        self.app = app
-        self.current_theme_name = "Dark"
-        self.palette = self.THEMES[self.current_theme_name]
-        self.color_changed_callbacks = []
-
-    def set_theme(self, theme_name):
-        if theme_name in self.THEMES:
-            self.current_theme_name = theme_name
-            self.palette = self.THEMES[theme_name]
-            self.apply_theme()
-            self._notify_color_change()
-            return True
-        return False
-
-    def get_accent_color(self):
-        return QColor(self.palette['accent'])
-
-    def register_color_callback(self, func):
-        self.color_changed_callbacks.append(func)
-
-    def _notify_color_change(self):
-        for func in self.color_changed_callbacks:
-            func()
-
-    def get_stylesheet(self):
-        p = self.palette
-        btn_primary = f"""
-        QPushButton {{
-            background-color: {p['accent']};
-            color: {"black" if p['name'] in ['Light'] else "white"};
-            border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold;
-        }}
-        QPushButton:hover {{ background-color: {p['accent_hover']}; }}
-        QPushButton:disabled {{ background-color: {p['border']}; color: {p['text_disabled']}; }}
-        """
-        btn_secondary = f"""
-        QPushButton {{
-            background-color: {p['alt_base']}; color: {p['text']};
-            border: 1px solid {p['border']}; padding: 8px 16px; border-radius: 4px;
-        }}
-        QPushButton:hover {{ background-color: {p['border']}; }}
-        """
-        return f"""
-        QWidget {{ background-color: {p['window']}; color: {p['text']}; font-family: 'Segoe UI', Arial, sans-serif; }}
-        QMainWindow {{ background-color: {p['window']}; }}
-        QTabWidget::pane {{ border: 1px solid {p['border']}; background-color: {p['window']}; border-radius: 4px; }}
-        QTabBar::tab {{
-            background-color: {p['alt_base']}; color: {p['text_disabled']}; padding: 10px 20px;
-            border-top-left-radius: 4px; border-top-right-radius: 4px; margin-right: 2px;
-        }}
-        QTabBar::tab:selected {{ background-color: {p['window']}; color: {p['accent']}; font-weight: bold; border-bottom: 2px solid {p['accent']}; }}
-        QGroupBox {{ color: {p['accent']}; font-weight: bold; border: 1px solid {p['border']}; border-radius: 6px; margin-top: 12px; padding-top: 12px; }}
-        QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 5px; }}
-        QLineEdit, QTextEdit, QSpinBox, QComboBox {{
-            background-color: {p['input_bg']}; color: {p['text']}; border: 1px solid {p['border']};
-            padding: 8px; border-radius: 4px; selection-background-color: {p['selection']};
-        }}
-        QLineEdit:focus, QTextEdit:focus, QSpinBox:focus {{ border: 1px solid {p['accent']}; }}
-        QComboBox::drop-down {{ border: none; width: 30px; }}
-        QComboBox QAbstractItemView {{ background-color: {p['base']}; selection-background-color: {p['accent']}; border: 1px solid {p['border']}; }}
-        QPushButton#btnPrimary {{ {btn_primary} }}
-        QPushButton#btnSecondary {{ {btn_secondary} }}
-        QPushButton {{
-            background-color: {p['alt_base']}; color: {p['text']}; border: 1px solid {p['border']};
-            padding: 8px 16px; border-radius: 4px;
-        }}
-        QPushButton:hover {{ background-color: {p['border']}; }}
-        QScrollArea {{ border: none; background-color: transparent; }}
-        QScrollBar:vertical {{ background-color: {p['scrollbar_bg']}; width: 12px; border-radius: 6px; }}
-        QScrollBar::handle:vertical {{ background-color: {p['scrollbar_handle']}; min-height: 20px; border-radius: 6px; margin: 2px; }}
-        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
-        QScrollBar:horizontal {{ background-color: {p['scrollbar_bg']}; height: 12px; border-radius: 6px; }}
-        QScrollBar::handle:horizontal {{ background-color: {p['scrollbar_handle']}; min-width: 20px; border-radius: 6px; margin: 2px; }}
-        QSlider::groove:horizontal {{ background: {p['border']}; height: 6px; border-radius: 3px; }}
-        QSlider::handle:horizontal {{ background: {p['accent']}; width: 18px; margin: -6px 0; border-radius: 9px; }}
-        QProgressBar {{ border: none; border-radius: 4px; background-color: {p['border']}; text-align: center; color: white; }}
-        QProgressBar::chunk {{ background-color: {p['accent']}; border-radius: 4px; }}
-        QCheckBox, QRadioButton {{ spacing: 8px; color: {p['text']}; }}
-        QCheckBox::indicator, QRadioButton::indicator {{
-            width: 18px; height: 18px; border-radius: 4px;
-            border: 2px solid {p['border']}; background-color: {p['input_bg']};
-        }}
-        QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-            background-color: {p['accent']}; border-color: {p['accent']};
-        }}
-        QToolTip {{ background-color: {p['base']}; color: {p['text']}; border: 1px solid {p['border']}; padding: 4px; }}
-        WallpaperCard {{ background-color: {p['alt_base']}; border-radius: 8px; border: 1px solid {p['border']}; }}
-        WallpaperCard:hover {{ border: 1px solid {p['accent']}; }}
-        """
-
-    def apply_theme(self):
-        self.app.setStyleSheet(self.get_stylesheet())
-        current_style = self.app.style()
-        for widget in self.app.topLevelWidgets():
-            widget.setStyle(current_style)
-
 # ==================== GLOBAL STATE ====================
 class AppState:
     def __init__(self):
         self.videos = []
+        self.video_paths = set()
         self.current_index = 0
         self.processes = {}
+        self.process_info = {}
         self.monitors = []
         self.current_mode = DEFAULT_SETTINGS["mode"]
         self.monitor_assignments = {}
         self.transition_duration = DEFAULT_SETTINGS["transition_duration"]
         self.auto_change_enabled = DEFAULT_SETTINGS["auto_change_enabled"]
         self.auto_change_interval = DEFAULT_SETTINGS["auto_change_interval"]
-        self.shortcuts_enabled = DEFAULT_SETTINGS["shortcuts_enabled"]
-        self.shortcuts = DEFAULT_SETTINGS["shortcuts"].copy()
         self.theme = DEFAULT_SETTINGS["theme"]
-        self.visualizer_enabled = DEFAULT_SETTINGS["visualizer_enabled"]
-        self.visualizer_style = DEFAULT_SETTINGS["visualizer_style"]
-        self.visualizer_bars = DEFAULT_SETTINGS["visualizer_bars"]
-        self.visualizer_height = DEFAULT_SETTINGS["visualizer_height"]
-        self.visualizer_rainbow = DEFAULT_SETTINGS["visualizer_rainbow"]
-        self.visualizer_bar_width = DEFAULT_SETTINGS["visualizer_bar_width"]
         self.transition_active = False
         self.log_entries = deque(maxlen=1000)
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
+        self.shutting_down = False
+        self.mpv_path = None
+        self.process_monitor_running = False
+        self.library_paths = set()
+        self.save_dir = SAVE_DIR
+        self.check_subfolders = False
+        self.settings_tab = None
+        self.library_tab = None
+        self.auto_change_thread = None
 
     def log(self, message, level="INFO"):
+        if self.shutting_down:
+            return
         timestamp = datetime.now().strftime("%H:%M:%S")
         entry = f"[{timestamp}] [{level}] {message}"
         self.log_entries.append(entry)
         try:
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(entry + "\n")
-        except:
-            pass
+        except (IOError, OSError) as e:
+            print(f"Failed to write to log: {e}")
         print(entry)
 
 state = AppState()
 
-# ==================== CLEANUP HANDLER ====================
-def cleanup_handler():
-    state.log("Application closing, cleaning up processes...")
-    stop_wallpapers()
+# ==================== VIDEO LIBRARY MANAGEMENT ====================
+def scan_folder_for_videos(folder, recursive=False):
+    """Scan a folder for video files"""
+    videos = []
+    try:
+        if recursive:
+            for root, dirs, files in os.walk(folder):
+                for file in files:
+                    if file.lower().endswith(VIDEO_EXTENSIONS):
+                        videos.append(os.path.join(root, file))
+        else:
+            for file in os.listdir(folder):
+                if file.lower().endswith(VIDEO_EXTENSIONS):
+                    full_path = os.path.join(folder, file)
+                    if os.path.isfile(full_path):
+                        videos.append(full_path)
+    except Exception as e:
+        state.log(f"Error scanning folder {folder}: {e}", "ERROR")
+    
+    return videos
 
-atexit.register(cleanup_handler)
+def load_videos():
+    """Load videos from all library paths"""
+    state.videos = []
+    state.video_paths = set()
+    
+    settings = load_settings()
+    check_subfolders = settings.get("check_subfolders", False)
+    
+    library_paths = [state.save_dir] + list(state.library_paths)
+    
+    for library_path in library_paths:
+        if not os.path.exists(library_path):
+            state.log(f"Library path does not exist: {library_path}", "WARNING")
+            continue
+            
+        videos = scan_folder_for_videos(library_path, check_subfolders)
+        
+        for video_path in videos:
+            if video_path not in state.video_paths:
+                state.videos.append(video_path)
+                state.video_paths.add(video_path)
+    
+    state.videos.sort()
+    state.log(f"Loaded {len(state.videos)} videos from {len(library_paths)} location(s)")
+    
+    if state.videos and state.current_index >= len(state.videos):
+        state.current_index = 0
 
-# ==================== AUDIO VISUALIZER ====================
-class AudioVisualizerWindow(QWidget):
-    def __init__(self, theme_manager):
-        super().__init__()
-        self.theme_manager = theme_manager
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnBottomHint |
-            Qt.WindowType.Tool
+def add_library_path(path):
+    """Add a new library path and scan for videos"""
+    if os.path.exists(path) and os.path.isdir(path):
+        if path not in state.library_paths:
+            state.library_paths.add(path)
+            
+            settings = load_settings()
+            settings["library_paths"] = list(state.library_paths)
+            save_settings(settings)
+            
+            load_videos()
+            save_config()
+            state.log(f"Added library path: {path}")
+            return True
+    return False
+
+def remove_library_path(path):
+    """Remove a library path"""
+    if path in state.library_paths:
+        state.library_paths.remove(path)
+        
+        settings = load_settings()
+        settings["library_paths"] = list(state.library_paths)
+        save_settings(settings)
+        
+        load_videos()
+        save_config()
+        state.log(f"Removed library path: {path}")
+        return True
+    return False
+
+def add_video_to_library(source_path):
+    """Add a video to the main library"""
+    if not os.path.exists(source_path):
+        return None
+        
+    filename = os.path.basename(source_path)
+    dest_path = os.path.join(state.save_dir, filename)
+    
+    if os.path.exists(dest_path):
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(dest_path):
+            new_filename = f"{base}_{counter}{ext}"
+            dest_path = os.path.join(state.save_dir, new_filename)
+            counter += 1
+    
+    try:
+        shutil.copy2(source_path, dest_path)
+        state.log(f"Added video to library: {os.path.basename(dest_path)}")
+        load_videos()
+        return dest_path
+    except Exception as e:
+        state.log(f"Error adding video: {e}", "ERROR")
+        return None
+
+def change_video_storage_location(new_path):
+    """Change the video storage location and migrate videos"""
+    if not os.path.exists(new_path):
+        try:
+            os.makedirs(new_path)
+        except Exception as e:
+            state.log(f"Error creating new directory: {e}", "ERROR")
+            return False
+    
+    old_path = state.save_dir
+    
+    settings = load_settings()
+    settings["video_path"] = new_path
+    if save_settings(settings):
+        global SAVE_DIR, CONFIG_FILE, LOG_FILE
+        SAVE_DIR = new_path
+        CONFIG_FILE = os.path.join(new_path, "config.json")
+        LOG_FILE = os.path.join(new_path, "wallpaper.log")
+        state.save_dir = new_path
+        
+        reply = QMessageBox.question(
+            None,
+            "Migrate Videos",
+            f"Do you want to copy existing videos from\n{old_path}\nto\n{new_path}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.style = state.visualizer_style
-        self.bars = state.visualizer_bars
-        self.height_factor = state.visualizer_height
-        self.audio_data = np.zeros(self.bars)
-        self.color = self.theme_manager.get_accent_color()
-        self.theme_manager.register_color_callback(self.update_color)
-        self.setWindowTitle("AudioVisualizer")
-        self.resize_screen()
-
-    def update_color(self):
-        self.color = self.theme_manager.get_accent_color()
-
-    def resize_screen(self):
-        if state.monitors:
-            m = state.monitors[0]
-            if self.style == "Radial":
-                self.setGeometry(m['x'], m['y'], m['width'], m['height'])
-            else:
-                self.setGeometry(m['x'], m['y'] + m['height'] - self.height_factor - 50,
-                               m['width'], self.height_factor + 50)
-        else:
-            self.setGeometry(0, 0, 1920, 1080)
-
-    def update_data(self, data):
-        self.audio_data = data
-        self.update()
-
-    def get_color_for_bar(self, index, total):
-        """Returns either accent color or rainbow color based on settings."""
-        if state.visualizer_rainbow:
-            hue = (index / total) * 360
-            return QColor.fromHsv(int(hue), 255, 255)
-        else:
-            return self.color
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = self.width()
-        h = self.height()
-        if self.style == "Bars":
-            self.draw_bars(painter, w, h)
-        elif self.style == "Slim":
-            self.draw_slim(painter, w, h)
-        elif self.style == "Wave":
-            self.draw_wave(painter, w, h)
-        elif self.style == "Wave Dots":
-            self.draw_wave_dots(painter, w, h)
-        elif self.style == "Radial":
-            self.draw_radial(painter, w, h)
-
-    def draw_bars(self, painter, w, h):
-        bar_width = w / self.bars
-        painter.setPen(Qt.PenStyle.NoPen)
-        draw_width = min(state.visualizer_bar_width, bar_width)
-        offset = (bar_width - draw_width) / 2
-        for i, val in enumerate(self.audio_data):
-            bar_h = val * self.height_factor
-            x = i * bar_width + offset
-            y = h - bar_h
-            color = self.get_color_for_bar(i, self.bars)
-            painter.setBrush(QBrush(color))
-            painter.drawRoundedRect(int(x), int(y), int(draw_width), int(bar_h), 3, 3)
-
-    def draw_slim(self, painter, w, h):
-        bar_width = w / self.bars
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        for i, val in enumerate(self.audio_data):
-            bar_h = val * self.height_factor
-            x = i * bar_width + (bar_width / 2)
-            y_start = h
-            y_end = h - bar_h
-            color = self.get_color_for_bar(i, self.bars)
-            color.setAlpha(200)
-            pen = QPen(color, state.visualizer_bar_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap)
-            painter.setPen(pen)
-            painter.drawLine(QPointF(x, y_start), QPointF(x, y_end))
-
-    def draw_wave(self, painter, w, h):
-        path = QPainterPath()
-        step = w / self.bars
-        path.moveTo(0, h)
-        for i, val in enumerate(self.audio_data):
-            x = i * step
-            y = h - (val * self.height_factor)
-            path.lineTo(x, y)
-        path.lineTo(w, h)
-        path.closeSubpath()
-        painter.setPen(Qt.PenStyle.NoPen)
-        fill_color = QColor(self.color) if not state.visualizer_rainbow else QColor.fromHsv(0, 0, 255)
-        fill_color.setAlpha(100)
-        painter.setBrush(QBrush(fill_color))
-        painter.drawPath(path)
-        for i, val in enumerate(self.audio_data):
-            x1 = (i-1) * step if i > 0 else 0
-            y1 = h - (self.audio_data[i-1] * self.height_factor) if i > 0 else h - (val * self.height_factor)
-            x2 = i * step
-            y2 = h - (val * self.height_factor)
-            if i == 0:
-                x1, y1 = x2, y2
-            color = self.get_color_for_bar(i, self.bars)
-            painter.setPen(QPen(color, state.visualizer_bar_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            if i > 0:
-                painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-
-    def draw_wave_dots(self, painter, w, h):
-        step = w / self.bars
-        painter.setPen(Qt.PenStyle.NoPen)
-        for i, val in enumerate(self.audio_data):
-            x = i * step + step / 2
-            y = h - (val * self.height_factor)
-            color = self.get_color_for_bar(i, self.bars)
-            painter.setBrush(QBrush(color))
-            radius = (state.visualizer_bar_width / 2) + (val * 4)
-            painter.drawEllipse(QPointF(x, y), radius, radius)
-
-    def draw_radial(self, painter, w, h):
-        center_x = w / 2
-        center_y = h / 2
-        radius_inner = min(w, h) * 0.2
-        max_bar_length = min(w, h) * 0.25
-        pen_width_glow = state.visualizer_bar_width + 4
-        for i, val in enumerate(self.audio_data):
-            angle = (360.0 / self.bars) * i - 90
-            angle_rad = math.radians(angle)
-            bar_len = val * max_bar_length
-            x1 = center_x + radius_inner * math.cos(angle_rad)
-            y1 = center_y + radius_inner * math.sin(angle_rad)
-            x2 = center_x + (radius_inner + bar_len) * math.cos(angle_rad)
-            y2 = center_y + (radius_inner + bar_len) * math.sin(angle_rad)
-            color = self.get_color_for_bar(i, self.bars)
-            glow_color = QColor(color)
-            glow_color.setAlpha(60)
-            painter.setPen(QPen(glow_color, pen_width_glow, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-            painter.setPen(QPen(color, state.visualizer_bar_width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-            painter.drawLine(QPointF(x1, y1), QPointF(x2, y2))
-        painter.setPen(QPen(self.color, 2))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawEllipse(QPointF(center_x, center_y), radius_inner, radius_inner)
-
-class AudioEngine(QThread):
-    data_ready = pyqtSignal(object)
-
-    def __init__(self):
-        super().__init__()
-        self.running = False
-        self.CHUNK = 1024
-
-    def run(self):
-        if not AUDIO_VIS_AVAILABLE:
-            return
-        self.running = True
-        p = pyaudio.PyAudio()
-        try:
-            default_speakers = p.get_default_wasapi_loopback()
-            stream = p.open(
-                format=pyaudio.paFloat32,
-                channels=2,
-                rate=int(default_speakers['defaultSampleRate']),
-                input=True,
-                input_device_index=default_speakers['index'],
-                frames_per_buffer=self.CHUNK
-            )
-            while self.running:
-                try:
-                    data = stream.read(self.CHUNK, exception_on_overflow=False)
-                    self.process_audio(data)
-                except:
-                    time.sleep(0.1)
-        except Exception as e:
-            state.log(f"Audio Engine Error: {e}", "ERROR")
-        finally:
-            p.terminate()
-
-    def process_audio(self, data):
-        try:
-            np_data = np.frombuffer(data, dtype=np.float32)
-            fft_data = np.abs(np.fft.rfft(np_data))
-            step = len(fft_data) // state.visualizer_bars
-            if step > 0:
-                bar_data = []
-                for i in range(state.visualizer_bars):
-                    idx = i * step
-                    val = np.mean(fft_data[idx:idx+step])
-                    val = min(1.0, val * 20.0)
-                    bar_data.append(val)
-                self.data_ready.emit(np.array(bar_data))
-        except:
-            pass
-
-    def stop(self):
-        self.running = False
-
-# ==================== KEYBOARD HANDLER ====================
-class KeyboardHandler(QObject):
-    next_signal = pyqtSignal()
-    prev_signal = pyqtSignal()
-    random_signal = pyqtSignal()
-    toggle_signal = pyqtSignal()
-
-    def __init__(self):
-        super().__init__()
-        self.listener = None
-        self.hotkeys = []
-        self.enabled = True
-
-    def start(self):
-        if not PYNPUT_AVAILABLE:
-            return False
-        try:
-            self._setup_hotkeys()
-            return True
-        except Exception as e:
-            state.log(f"Keyboard shortcut error: {e}", "ERROR")
-            return False
-
-    def _setup_hotkeys(self):
-        self.hotkeys = []
-        actions = {
-            'next': lambda: self.next_signal.emit(),
-            'prev': lambda: self.prev_signal.emit(),
-            'random': lambda: self.random_signal.emit(),
-            'toggle': lambda: self.toggle_signal.emit()
-        }
-        for action, shortcut_str in state.shortcuts.items():
-            if action in actions:
-                try:
-                    keys = keyboard.HotKey.parse(shortcut_str)
-                    hotkey = keyboard.HotKey(keys, actions[action])
-                    self.hotkeys.append(hotkey)
-                except:
-                    pass
-        if self.hotkeys:
-            self.listener = keyboard.Listener(on_press=self._on_press, on_release=self._on_release, suppress=False)
-            self.listener.start()
-
-    def _on_press(self, key):
-        if not self.enabled:
-            return
-        canonical = self.listener.canonical(key)
-        for hotkey in self.hotkeys:
-            hotkey.press(canonical)
-
-    def _on_release(self, key):
-        if not self.enabled:
-            return
-        canonical = self.listener.canonical(key)
-        for hotkey in self.hotkeys:
-            hotkey.release(canonical)
-
-    def stop(self):
-        if self.listener:
-            self.listener.stop()
-
-# ==================== MPV & WINDOW MANAGEMENT ====================
-def find_window(pid, timeout=15):
-    start = time.time()
-    while time.time() - start < timeout:
-        hwnds = []
-        def callback(hwnd, _):
+        
+        if reply == QMessageBox.StandardButton.Yes and os.path.exists(old_path):
             try:
-                _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
-                if found_pid == pid:
-                    hwnds.append(hwnd)
-            except:
-                pass
-        win32gui.EnumWindows(callback, None)
-        if hwnds:
-            return hwnds[0]
-        time.sleep(0.1)
-    return None
-
-def set_window_opacity(hwnd, opacity):
-    try:
-        SetLayeredWindowAttributes(hwnd, 0, int(opacity), LWA_ALPHA)
-        return True
-    except:
-        return False
-
-def prepare_window_styles(hwnd):
-    try:
-        style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
-        style = win32con.WS_POPUP | win32con.WS_CLIPCHILDREN | win32con.WS_CLIPSIBLINGS
-        win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
-        ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-        ex_style |= (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
-        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
-        return True
-    except Exception as e:
-        state.log(f"Style error: {e}", "ERROR")
-        return False
-
-def get_monitor_geometry(monitor_idx=None):
-    if monitor_idx is not None and 0 <= monitor_idx < len(state.monitors):
-        m = state.monitors[monitor_idx]
-        return (m['x'], m['y'], m['width'], m['height'])
-    if not state.monitors:
-        return (0, 0, 1920, 1080)
-    min_x = min(m['x'] for m in state.monitors)
-    min_y = min(m['y'] for m in state.monitors)
-    max_x = max(m['x'] + m['width'] for m in state.monitors)
-    max_y = max(m['y'] + m['height'] for m in state.monitors)
-    return (min_x, min_y, max_x - min_x, max_y - max_y)
-
-def launch_mpv(video, x, y, width, height):
-    geometry = f"{width}x{height}+{x}+{y}"
-    args = [
-        "mpv", "--loop-file=inf", "--no-audio", "--border=no", "--force-window=immediate",
-        "--keepaspect=no", "--profile=fast", "--hwdec=auto-safe", "--framedrop=decoder+vo",
-        "--no-input-default-bindings", "--no-osc", "--really-quiet", "--ontop=no",
-        "--input-cursor=no", "--cursor-autohide=no", "--geometry=" + geometry, video
-    ]
-    creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
-    return subprocess.Popen(args, creationflags=creationflags)
-
-def keep_at_bottom(hwnd):
-    while True:
-        try:
-            if not win32gui.IsWindow(hwnd):
-                break
-            win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
-                                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
-                                win32con.SWP_NOACTIVATE | 0x0200)
-            time.sleep(2)
-        except:
-            break
-
-def setup_wallpaper_window(p, monitor_idx):
-    try:
-        hwnd = find_window(p.pid, timeout=10)
-        if not hwnd:
-            return None, None
-        x, y, w, h = get_monitor_geometry(monitor_idx)
-        win32gui.ShowWindow(hwnd, SW_HIDE)
-        prepare_window_styles(hwnd)
-        time.sleep(0.4)
-        if not win32gui.IsWindow(hwnd):
-            return None, None
-        win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, x, y, w, h,
-                            win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED |
-                            0x0200 | win32con.SWP_SHOWWINDOW)
-        threading.Thread(target=keep_at_bottom, args=(hwnd,), daemon=True).start()
-        return hwnd, p
-    except Exception as e:
-        state.log(f"Setup error: {e}", "ERROR")
-        return None, None
-
-# ==================== WALLPAPER CONTROL ====================
-def detect_monitors():
-    state.monitors = []
-    for m in get_monitors():
-        state.monitors.append({'x': m.x, 'y': m.y, 'width': m.width, 'height': m.height, 'is_primary': m.is_primary})
-    state.monitors.sort(key=lambda x: x['x'])
-
-def stop_wallpapers():
-    for idx, procs in list(state.processes.items()):
-        for p in procs:
-            try:
-                p.kill()
-            except:
-                pass
-    state.processes = {}
-
-def instant_switch_monitor(monitor_idx, new_video_idx):
-    if not state.videos or new_video_idx >= len(state.videos):
-        return False
-    new_video = state.videos[new_video_idx]
-    if monitor_idx in state.processes:
-        for p in state.processes[monitor_idx]:
-            try:
-                p.kill()
-            except:
-                pass
-        state.processes[monitor_idx] = []
-    try:
-        x, y, w, h = get_monitor_geometry(monitor_idx)
-        p = launch_mpv(new_video, x, y, w, h)
-        hwnd, p = setup_wallpaper_window(p, monitor_idx)
-        if hwnd:
-            state.processes[monitor_idx] = [p]
-            return True
-        return False
-    except:
-        return False
-
-def crossfade_monitor(monitor_idx, new_video_idx):
-    with state.lock:
-        if state.transition_active:
-            return False
-        state.transition_active = True
-        if not state.videos or new_video_idx >= len(state.videos):
-            state.transition_active = False
-            return False
-        new_video = state.videos[new_video_idx]
-        state.log(f"Monitor {monitor_idx}: Crossfading to {os.path.basename(new_video)}")
-        try:
-            x, y, w, h = get_monitor_geometry(monitor_idx)
-            old_procs = state.processes.get(monitor_idx, []).copy()
-            new_p = launch_mpv(new_video, x, y, w, h)
-            new_hwnd = find_window(new_p.pid, timeout=10)
-            if not new_hwnd:
-                state.transition_active = False
-                return False
-            win32gui.ShowWindow(new_hwnd, SW_HIDE)
-            prepare_window_styles(new_hwnd)
-            set_window_opacity(new_hwnd, 0)
-            win32gui.SetWindowPos(new_hwnd, win32con.HWND_BOTTOM, x, y, w, h,
-                                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED | 0x0200 | win32con.SWP_SHOWWINDOW)
-            if monitor_idx not in state.processes:
-                state.processes[monitor_idx] = []
-            state.processes[monitor_idx].append(new_p)
-            threading.Thread(target=keep_at_bottom, args=(new_hwnd,), daemon=True).start()
-            steps = int(state.transition_duration * 60)
-            step_duration = state.transition_duration / steps
-            for i in range(steps + 1):
-                progress = i / steps
-                eased = progress * progress * (3 - 2 * progress)
-                new_opacity = int(255 * eased)
-                old_opacity = int(255 * (1 - eased))
-                set_window_opacity(new_hwnd, new_opacity)
-                for old_p in old_procs:
-                    try:
-                        old_hwnd = find_window(old_p.pid, timeout=0.1)
-                        if old_hwnd:
-                            set_window_opacity(old_hwnd, old_opacity)
-                    except:
-                        pass
-                time.sleep(step_duration)
-            for old_p in old_procs:
-                try:
-                    old_p.kill()
-                except:
-                    pass
-            state.processes[monitor_idx] = [p for p in state.processes[monitor_idx] if p.poll() is None]
-            return True
-        except Exception as e:
-            state.log(f"Transition error: {e}", "ERROR")
-            return False
-        finally:
-            state.transition_active = False
-
-def start_wallpaper(video=None):
-    """Start wallpaper on all monitors"""
-    stop_wallpapers()
-    if not state.videos:
-        state.log("No videos in library", "WARNING")
-        return
-    
-    # If video is None, use current_index
-    if video is None:
-        video = state.videos[state.current_index]
-    
-    if state.current_mode == "span":
-        x, y, w, h = get_monitor_geometry()
-        p = launch_mpv(video, x, y, w, h)
-        hwnd, p = setup_wallpaper_window(p, 0)
-        if hwnd:
-            state.processes = {0: [p]}
-            state.log(f"Started wallpaper: {os.path.basename(video)}")
-    else:
-        # Individual or duplicate mode
-        for i in range(len(state.monitors)):
-            video_idx = state.current_index
-            if state.current_mode == "individual":
-                video_idx = state.monitor_assignments.get(i, i) % len(state.videos)
-                video_to_use = state.videos[video_idx]
-            else:  # duplicate mode
-                video_to_use = video
+                if os.path.exists(os.path.join(old_path, "config.json")):
+                    shutil.copy2(
+                        os.path.join(old_path, "config.json"),
+                        os.path.join(new_path, "config.json")
+                    )
                 
-            threading.Thread(target=instant_switch_monitor, args=(i, video_idx if state.current_mode == "individual" else state.current_index), daemon=True).start()
-            time.sleep(0.2)  # Small delay to prevent conflicts
-
-def next_wallpaper():
-    if not state.videos:
-        return
-    state.current_index = (state.current_index + 1) % len(state.videos)
-    if state.current_mode == "individual":
-        for i in range(len(state.monitors)):
-            new_idx = (state.monitor_assignments.get(i, 0) + 1) % len(state.videos)
-            state.monitor_assignments[i] = new_idx
-            threading.Thread(target=crossfade_monitor, args=(i, new_idx), daemon=True).start()
-    else:
-        start_wallpaper()
-
-def prev_wallpaper():
-    if not state.videos:
-        return
-    state.current_index = (state.current_index - 1) % len(state.videos)
-    if state.current_mode == "individual":
-        for i in range(len(state.monitors)):
-            new_idx = (state.monitor_assignments.get(i, 0) - 1) % len(state.videos)
-            state.monitor_assignments[i] = new_idx
-            threading.Thread(target=crossfade_monitor, args=(i, new_idx), daemon=True).start()
-    else:
-        start_wallpaper()
-
-def random_wallpaper():
-    """Set a random wallpaper from the library"""
-    if not state.videos:
-        state.log("No videos in library to set random wallpaper", "WARNING")
-        # Show message to user if QApplication exists
-        try:
-            QMessageBox.information(None, "No Videos", "Please add videos to the library first")
-        except:
-            pass
-        return
+                for filename in os.listdir(old_path):
+                    if filename.lower().endswith(VIDEO_EXTENSIONS):
+                        src = os.path.join(old_path, filename)
+                        dst = os.path.join(new_path, filename)
+                        if not os.path.exists(dst):
+                            shutil.copy2(src, dst)
+                
+                state.log("Videos migrated successfully")
+            except Exception as e:
+                state.log(f"Error migrating videos: {e}", "ERROR")
+        
+        load_videos()
+        return True
     
-    # Generate random index
-    new_index = random.randint(0, len(state.videos) - 1)
-    state.current_index = new_index
-    video_name = os.path.basename(state.videos[new_index])
-    state.log(f"Setting random wallpaper: {video_name}")
-    
-    if state.current_mode == "individual":
-        # For individual mode, set all monitors to the same random video
-        for i in range(len(state.monitors)):
-            state.monitor_assignments[i] = new_index
-            # Use threading for smooth transitions
-            threading.Thread(target=crossfade_monitor, args=(i, new_index), daemon=True).start()
-    else:
-        # For span or duplicate mode
-        stop_wallpapers()  # Clean stop before starting new
-        time.sleep(0.1)    # Brief pause
-        start_wallpaper(state.videos[new_index])
+    return False
 
 # ==================== CONFIG & DATA ====================
 def load_config():
+    """Load configuration with validation"""
     if os.path.exists(CONFIG_FILE):
         try:
-            with open(CONFIG_FILE, 'r') as f:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
                 config = json.load(f)
-                state.current_mode = config.get('mode', DEFAULT_SETTINGS["mode"])
-                state.monitor_assignments = {int(k): v for k, v in config.get('assignments', {}).items()}
-                state.transition_duration = config.get('transition_duration', DEFAULT_SETTINGS["transition_duration"])
-                state.auto_change_enabled = config.get('auto_change_enabled', DEFAULT_SETTINGS["auto_change_enabled"])
-                state.auto_change_interval = config.get('auto_change_interval', DEFAULT_SETTINGS["auto_change_interval"])
-                state.theme = config.get('theme', DEFAULT_SETTINGS["theme"])
-                state.visualizer_enabled = config.get('visualizer_enabled', DEFAULT_SETTINGS["visualizer_enabled"])
-                state.visualizer_style = config.get('visualizer_style', DEFAULT_SETTINGS["visualizer_style"])
-                state.visualizer_bars = config.get('visualizer_bars', DEFAULT_SETTINGS["visualizer_bars"])
-                state.visualizer_height = config.get('visualizer_height', DEFAULT_SETTINGS["visualizer_height"])
-                state.visualizer_rainbow = config.get('visualizer_rainbow', DEFAULT_SETTINGS["visualizer_rainbow"])
-                state.visualizer_bar_width = config.get('visualizer_bar_width', DEFAULT_SETTINGS["visualizer_bar_width"])
-                state.shortcuts_enabled = config.get('shortcuts_enabled', DEFAULT_SETTINGS["shortcuts_enabled"])
-        except:
-            pass
+            
+            if not isinstance(config, dict):
+                state.log("Invalid config format, using defaults", "WARNING")
+                return
+            
+            if 'mode' in config and config['mode'] in ["span", "duplicate", "individual"]:
+                state.current_mode = config['mode']
+            
+            if 'assignments' in config and isinstance(config['assignments'], dict):
+                state.monitor_assignments = {}
+                for k, v in config['assignments'].items():
+                    try:
+                        state.monitor_assignments[int(k)] = int(v)
+                    except (ValueError, TypeError):
+                        continue
+                    
+            if 'transition_duration' in config:
+                try:
+                    duration = float(config['transition_duration'])
+                    state.transition_duration = max(0.5, min(3.0, duration))
+                except (ValueError, TypeError):
+                    pass
+            
+            if 'auto_change_enabled' in config:
+                state.auto_change_enabled = bool(config['auto_change_enabled'])
+            
+            if 'auto_change_interval' in config:
+                try:
+                    interval = int(config['auto_change_interval'])
+                    state.auto_change_interval = max(60, min(7200, interval))
+                except (ValueError, TypeError):
+                    pass
+            
+            if 'theme' in config:
+                state.theme = config['theme']
+            
+            if 'library_paths' in config and isinstance(config['library_paths'], list):
+                for path in config['library_paths']:
+                    if os.path.exists(path) and os.path.isdir(path):
+                        state.library_paths.add(path)
+            
+            state.log("Configuration loaded")
+            
+        except Exception as e:
+            state.log(f"Error loading config: {e}", "ERROR")
+    
+    if not os.path.exists(state.save_dir):
+        try:
+            os.makedirs(state.save_dir)
+        except Exception as e:
+            state.log(f"Error creating save directory: {e}", "ERROR")
 
 def save_config():
+    """Save configuration safely"""
     config = {
         'mode': state.current_mode,
         'assignments': state.monitor_assignments,
@@ -850,64 +404,1063 @@ def save_config():
         'auto_change_enabled': state.auto_change_enabled,
         'auto_change_interval': state.auto_change_interval,
         'theme': state.theme,
-        'visualizer_enabled': state.visualizer_enabled,
-        'visualizer_style': state.visualizer_style,
-        'visualizer_bars': state.visualizer_bars,
-        'visualizer_height': state.visualizer_height,
-        'visualizer_rainbow': state.visualizer_rainbow,
-        'visualizer_bar_width': state.visualizer_bar_width,
-        'shortcuts_enabled': state.shortcuts_enabled
+        'library_paths': list(state.library_paths)
     }
+    
+    temp_file = CONFIG_FILE + ".tmp"
     try:
-        with open(CONFIG_FILE, 'w') as f:
+        with open(temp_file, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
-    except:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        
+        if os.path.exists(CONFIG_FILE):
+            os.replace(temp_file, CONFIG_FILE)
+        else:
+            os.rename(temp_file, CONFIG_FILE)
+            
+        state.log("Configuration saved")
+            
+    except Exception as e:
+        state.log(f"Error saving config: {e}", "ERROR")
+        try:
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
+        except:
+            pass
 
-def load_videos():
-    state.videos = []
-    if not os.path.exists(SAVE_DIR):
-        os.makedirs(SAVE_DIR)
-    for f in os.listdir(SAVE_DIR):
-        if f.lower().endswith(VIDEO_EXTENSIONS):
-            state.videos.append(os.path.join(SAVE_DIR, f))
-    state.videos.sort()
+# ==================== PROCESS MANAGEMENT ====================
+class ProcessManager:
+    """Dedicated process manager for handling MPV processes"""
+    
+    @staticmethod
+    def get_process_info(pid):
+        """Get detailed process information using psutil"""
+        try:
+            process = psutil.Process(pid)
+            with process.oneshot():
+                return {
+                    'pid': pid,
+                    'name': process.name(),
+                    'exe': process.exe(),
+                    'cmdline': process.cmdline(),
+                    'status': process.status(),
+                    'create_time': process.create_time(),
+                    'cpu_percent': process.cpu_percent(),
+                    'memory_percent': process.memory_percent(),
+                    'connections': len(process.connections()),
+                    'is_running': process.is_running()
+                }
+        except psutil.NoSuchProcess:
+            return {'pid': pid, 'is_running': False}
+        except (psutil.AccessDenied, psutil.ZombieProcess) as e:
+            state.log(f"Access denied to process {pid}: {e}", "WARNING")
+            return {'pid': pid, 'is_running': False, 'error': str(e)}
+        except Exception as e:
+            state.log(f"Unexpected error getting process info for {pid}: {e}", "ERROR")
+            return {'pid': pid, 'is_running': False}
+
+    @staticmethod
+    def is_zombie_process(pid):
+        """Check if a process is a zombie"""
+        try:
+            process = psutil.Process(pid)
+            return process.status() == psutil.STATUS_ZOMBIE
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def graceful_terminate(pid, timeout=PROCESS_CLEANUP_TIMEOUT):
+        """Gracefully terminate a process with proper cleanup"""
+        try:
+            process = psutil.Process(pid)
+            
+            if ProcessManager.is_zombie_process(pid):
+                state.log(f"Process {pid} is a zombie, killing forcefully", "WARNING")
+                process.kill()
+                return True
+            
+            state.log(f"Attempting graceful termination of process {pid}")
+            process.terminate()
+            
+            gone, alive = psutil.wait_procs([process], timeout=timeout)
+            
+            if process in alive:
+                state.log(f"Process {pid} did not terminate gracefully, force killing", "WARNING")
+                process.kill()
+                
+                gone, alive = psutil.wait_procs([process], timeout=timeout/2)
+                
+                if process in alive:
+                    state.log(f"Process {pid} still alive after kill", "ERROR")
+                    return False
+            
+            try:
+                handle = win32api.OpenProcess(win32con.PROCESS_TERMINATE, False, pid)
+                if handle:
+                    win32api.CloseHandle(handle)
+            except (win32api.error, Exception):
+                pass
+            
+            state.log(f"Process {pid} successfully terminated")
+            return True
+            
+        except psutil.NoSuchProcess:
+            return True
+        except psutil.AccessDenied as e:
+            state.log(f"Access denied terminating process {pid}: {e}", "ERROR")
+            return False
+        except Exception as e:
+            state.log(f"Unexpected error terminating process {pid}: {e}", "ERROR")
+            return False
+
+    @staticmethod
+    def kill_process_tree(pid, include_parent=True):
+        """Kill an entire process tree"""
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            
+            for child in children:
+                try:
+                    ProcessManager.graceful_terminate(child.pid)
+                except Exception as e:
+                    state.log(f"Error killing child process {child.pid}: {e}", "ERROR")
+            
+            if include_parent:
+                ProcessManager.graceful_terminate(pid)
+                
+            return True
+            
+        except psutil.NoSuchProcess:
+            return True
+        except Exception as e:
+            state.log(f"Error killing process tree for {pid}: {e}", "ERROR")
+            return False
+
+    @staticmethod
+    def cleanup_dead_processes():
+        """Clean up dead processes from state"""
+        with state.lock:
+            dead_pids = []
+            
+            for pid, info in list(state.process_info.items()):
+                try:
+                    process = psutil.Process(pid)
+                    if not process.is_running() or ProcessManager.is_zombie_process(pid):
+                        dead_pids.append(pid)
+                        state.log(f"Found dead/zombie process {pid}, cleaning up")
+                except psutil.NoSuchProcess:
+                    dead_pids.append(pid)
+                except Exception:
+                    dead_pids.append(pid)
+            
+            for pid in dead_pids:
+                if pid in state.process_info:
+                    del state.process_info[pid]
+                
+                for monitor_idx, procs in list(state.processes.items()):
+                    state.processes[monitor_idx] = [p for p in procs if p.pid != pid]
+            
+            return len(dead_pids)
+
+    @staticmethod
+    def get_all_mpv_processes():
+        """Get all MPV processes running on the system"""
+        mpv_processes = []
+        try:
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['name'] and 'mpv' in proc.info['name'].lower():
+                        mpv_processes.append(proc.info)
+                    elif proc.info['cmdline'] and any('mpv' in arg.lower() for arg in proc.info['cmdline']):
+                        mpv_processes.append(proc.info)
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception as e:
+            state.log(f"Error scanning for MPV processes: {e}", "ERROR")
+        
+        return mpv_processes
+
+    @staticmethod
+    def cleanup_orphaned_mpv():
+        """Clean up MPV processes that aren't tracked"""
+        our_pids = set(state.process_info.keys())
+        all_mpv = ProcessManager.get_all_mpv_processes()
+        
+        for proc_info in all_mpv:
+            pid = proc_info['pid']
+            if pid not in our_pids:
+                cmdline = ' '.join(proc_info.get('cmdline', [])).lower()
+                if '--geometry' in cmdline and any(res in cmdline for res in ['x', '+']):
+                    state.log(f"Found orphaned MPV process {pid}, terminating")
+                    ProcessManager.graceful_terminate(pid)
+
+# ==================== PROCESS MONITOR THREAD ====================
+class ProcessMonitorThread(QThread):
+    """Background thread to monitor process health"""
+    
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        
+    def run(self):
+        self.running = True
+        state.process_monitor_running = True
+        
+        while self.running and not state.shutting_down:
+            try:
+                dead_count = ProcessManager.cleanup_dead_processes()
+                
+                if dead_count > 0:
+                    ProcessManager.cleanup_orphaned_mpv()
+                
+                for _ in range(PROCESS_HEALTH_CHECK_INTERVAL):
+                    if not self.running or state.shutting_down:
+                        break
+                    time.sleep(1)
+                    
+            except Exception as e:
+                state.log(f"Process monitor error: {e}", "ERROR")
+                time.sleep(5)
+    
+    def stop(self):
+        self.running = False
+        state.process_monitor_running = False
+
+# ==================== AUTO-CHANGE TIMER (FIXED) ====================
+class AutoChangeThread(QThread):
+    """Thread for auto-changing wallpapers"""
+    change_signal = pyqtSignal()  # Signal to trigger wallpaper change in main thread
+    
+    def __init__(self):
+        super().__init__()
+        self.running = False
+        self.change_signal.connect(self.do_change)
+        
+    def do_change(self):
+        """Safely trigger wallpaper change in main thread"""
+        if state.auto_change_enabled and len(state.videos) > 1 and not state.shutting_down:
+            state.log("Auto-change: Changing wallpaper")
+            random_wallpaper()
+        
+    def run(self):
+        self.running = True
+        state.log("Auto-change thread started")
+        
+        while self.running and not state.shutting_down:
+            try:
+                if state.auto_change_enabled and len(state.videos) > 1:
+                    interval = state.auto_change_interval
+                    minutes = interval // 60
+                    state.log(f"Auto-change: Next change in {minutes} minute(s)")
+                    
+                    # Sleep in 1-second increments to allow quick response to changes
+                    for i in range(interval):
+                        if not self.running or state.shutting_down or not state.auto_change_enabled:
+                            break
+                        time.sleep(1)
+                        
+                        # Log every minute for debugging
+                        if i > 0 and i % 60 == 0:
+                            remaining = (interval - i) // 60
+                            if remaining > 0:
+                                state.log(f"Auto-change: {remaining} minute(s) remaining")
+                    
+                    # Check if we should change
+                    if (self.running and not state.shutting_down and 
+                        state.auto_change_enabled and len(state.videos) > 1):
+                        self.change_signal.emit()
+                else:
+                    time.sleep(1)
+                    
+            except Exception as e:
+                state.log(f"Auto-change thread error: {e}", "ERROR")
+                time.sleep(5)
+        
+        state.log("Auto-change thread stopped")
+                
+    def stop(self):
+        state.log("Stopping auto-change thread")
+        self.running = False
+
+# ==================== CLEANUP HANDLER ====================
+def cleanup_handler():
+    """Enhanced cleanup with specific exception handling"""
+    state.shutting_down = True
+    state.log("Application closing, performing graceful cleanup...")
+    
+    if hasattr(state, 'process_monitor') and state.process_monitor:
+        try:
+            state.process_monitor.stop()
+            state.process_monitor.wait(2000)
+        except Exception as e:
+            state.log(f"Error stopping process monitor: {e}", "ERROR")
+    
+    if state.auto_change_thread:
+        try:
+            state.auto_change_thread.stop()
+            state.auto_change_thread.wait(2000)
+        except Exception as e:
+            state.log(f"Error stopping auto-change thread: {e}", "ERROR")
+    
+    stop_wallpapers()
+    
+    try:
+        ProcessManager.cleanup_orphaned_mpv()
+    except Exception as e:
+        state.log(f"Error in final orphan cleanup: {e}", "ERROR")
+    
+    state.log("Cleanup completed")
+
+def signal_handler(signum, frame):
+    """Handle termination signals"""
+    state.log(f"Received signal {signum}, shutting down...")
+    cleanup_handler()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+atexit.register(cleanup_handler)
+
+# ==================== MPV MANAGEMENT ====================
+def find_mpv():
+    """Find mpv executable in common locations with caching"""
+    if state.mpv_path:
+        return state.mpv_path
+        
+    possible_paths = [
+        "mpv",
+        "mpv.exe",
+        os.path.join(os.path.dirname(sys.executable), "mpv.exe"),
+        os.path.join(os.environ.get('PROGRAMFILES', ''), "mpv", "mpv.exe"),
+        os.path.join(os.environ.get('PROGRAMFILES(X86)', ''), "mpv", "mpv.exe"),
+        os.path.join(os.path.expanduser("~"), "scoop", "apps", "mpv", "current", "mpv.exe"),
+        os.path.join(os.path.expanduser("~"), "AppData", "Local", "Programs", "mpv", "mpv.exe"),
+    ]
+    
+    for path in possible_paths:
+        try:
+            result = subprocess.run(
+                [path, "--version"], 
+                capture_output=True, 
+                text=True, 
+                timeout=2,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            )
+            if result.returncode == 0:
+                state.mpv_path = path
+                state.log(f"Found mpv at: {path}")
+                return path
+        except (subprocess.SubprocessError, FileNotFoundError, PermissionError):
+            continue
+        except Exception as e:
+            state.log(f"Unexpected error checking mpv at {path}: {e}", "DEBUG")
+            continue
+    
+    state.log("MPV not found in PATH or common locations", "ERROR")
+    return None
+
+def verify_mpv():
+    """Verify mpv is available and show error if not"""
+    mpv_path = find_mpv()
+    if not mpv_path:
+        QMessageBox.critical(
+            None, 
+            "MPV Not Found",
+            "MPV player is required but not found.\n\n"
+            "Please install mpv:\n"
+            "1. Download from: https://mpv.io/installation/\n"
+            "2. Add to PATH or install in default location\n"
+            "3. Restart the application"
+        )
+        return False
+    return True
+
+# ==================== WINDOW MANAGEMENT ====================
+def find_window(pid, timeout=15):
+    """Find window by PID with improved error handling"""
+    start = time.time()
+    while time.time() - start < timeout and not state.shutting_down:
+        hwnds = []
+        def callback(hwnd, _):
+            try:
+                _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if found_pid == pid:
+                    hwnds.append(hwnd)
+            except (win32process.error, Exception):
+                pass
+                
+        try:
+            win32gui.EnumWindows(callback, None)
+            if hwnds:
+                return hwnds[0]
+        except win32gui.error as e:
+            state.log(f"Error enumerating windows: {e}", "DEBUG")
+            
+        time.sleep(0.1)
+    return None
+
+def set_window_opacity(hwnd, opacity):
+    """Set window opacity with validation"""
+    try:
+        if win32gui.IsWindow(hwnd):
+            result = SetLayeredWindowAttributes(hwnd, 0, int(opacity), LWA_ALPHA)
+            return result != 0
+    except (ctypes.ArgumentError, OSError, Exception):
+        pass
+    return False
+
+def prepare_window_styles(hwnd):
+    """Prepare window styles for wallpaper"""
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return False
+        
+        try:
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        except win32gui.error as e:
+            state.log(f"Error getting window styles: {e}", "ERROR")
+            return False
+        
+        style = win32con.WS_POPUP | win32con.WS_CLIPCHILDREN | win32con.WS_CLIPSIBLINGS
+        try:
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, style)
+        except win32gui.error as e:
+            state.log(f"Error setting window style: {e}", "ERROR")
+            return False
+        
+        ex_style |= (WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW)
+        try:
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+        except win32gui.error as e:
+            state.log(f"Error setting extended style: {e}", "ERROR")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        state.log(f"Unexpected error in prepare_window_styles: {e}", "ERROR")
+        return False
+
+def keep_at_bottom(hwnd):
+    """Keep window at bottom with health checks"""
+    check_interval = 2
+    while not state.shutting_down:
+        try:
+            if not win32gui.IsWindow(hwnd):
+                break
+            
+            try:
+                current_z = win32gui.GetWindow(hwnd, win32con.GW_HWNDPREV)
+                if current_z != 0:
+                    win32gui.SetWindowPos(
+                        hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0,
+                        win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                        win32con.SWP_NOACTIVATE | 0x0200
+                    )
+            except win32gui.error as e:
+                if "invalid window handle" in str(e).lower():
+                    break
+                
+        except Exception:
+            break
+            
+        time.sleep(check_interval)
+
+# ==================== MONITOR MANAGEMENT ====================
+def detect_monitors():
+    """Detect monitors with fallback"""
+    try:
+        monitors = []
+        for m in get_monitors():
+            monitors.append({
+                'x': m.x, 'y': m.y, 
+                'width': m.width, 'height': m.height, 
+                'is_primary': m.is_primary
+            })
+        
+        if not monitors:
+            monitors.append({'x': 0, 'y': 0, 'width': 1920, 'height': 1080, 'is_primary': True})
+            state.log("No monitors detected, using fallback resolution", "WARNING")
+        
+        monitors.sort(key=lambda x: x['x'])
+        state.monitors = monitors
+        state.log(f"Detected {len(monitors)} monitor(s)")
+        return True
+        
+    except Exception as e:
+        state.log(f"Monitor detection error: {e}", "ERROR")
+        state.monitors = [{'x': 0, 'y': 0, 'width': 1920, 'height': 1080, 'is_primary': True}]
+        return False
+
+def get_monitor_geometry(monitor_idx=None):
+    """Get geometry for specific monitor or combined span"""
+    if not state.monitors:
+        return (0, 0, 1920, 1080)
+        
+    if monitor_idx is not None and 0 <= monitor_idx < len(state.monitors):
+        m = state.monitors[monitor_idx]
+        return (m['x'], m['y'], m['width'], m['height'])
+    
+    try:
+        min_x = min(m['x'] for m in state.monitors)
+        min_y = min(m['y'] for m in state.monitors)
+        max_x = max(m['x'] + m['width'] for m in state.monitors)
+        max_y = max(m['y'] + m['height'] for m in state.monitors)
+        return (min_x, min_y, max_x - min_x, max_y - min_y)
+    except (KeyError, ValueError) as e:
+        state.log(f"Error calculating monitor geometry: {e}", "ERROR")
+        return (0, 0, 1920, 1080)
+
+# ==================== WALLPAPER CONTROL ====================
+def launch_mpv(video, x, y, width, height):
+    """Launch mpv with retry logic and process tracking"""
+    if not state.mpv_path and not find_mpv():
+        return None
+        
+    geometry = f"{width}x{height}+{x}+{y}"
+    args = [
+        state.mpv_path, 
+        "--loop-file=inf", 
+        "--no-audio", 
+        "--border=no", 
+        "--force-window=immediate",
+        "--keepaspect=no", 
+        "--profile=fast", 
+        "--hwdec=auto-safe", 
+        "--framedrop=decoder+vo",
+        "--no-input-default-bindings", 
+        "--no-osc", 
+        "--really-quiet", 
+        "--ontop=no",
+        "--input-cursor=no", 
+        "--cursor-autohide=no", 
+        "--geometry=" + geometry, 
+        video
+    ]
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, 'CREATE_NO_WINDOW') else 0
+            p = subprocess.Popen(
+                args, 
+                creationflags=creationflags,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            with state.lock:
+                state.process_info[p.pid] = {
+                    'start_time': time.time(),
+                    'video': video,
+                    'geometry': geometry
+                }
+            
+            return p
+            
+        except (subprocess.SubprocessError, OSError) as e:
+            state.log(f"Failed to launch mpv (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                state.log(f"Failed to launch mpv after {MAX_RETRIES} attempts", "ERROR")
+                return None
+        except Exception as e:
+            state.log(f"Unexpected error launching mpv: {e}", "ERROR")
+            return None
+
+def setup_wallpaper_window(p, monitor_idx):
+    """Setup wallpaper window with comprehensive error handling"""
+    try:
+        hwnd = find_window(p.pid, timeout=10)
+        if not hwnd:
+            state.log(f"Could not find window for process {p.pid}", "WARNING")
+            return None, None
+            
+        x, y, w, h = get_monitor_geometry(monitor_idx)
+        
+        try:
+            win32gui.ShowWindow(hwnd, SW_HIDE)
+        except win32gui.error as e:
+            state.log(f"Error hiding window: {e}", "ERROR")
+            return None, None
+        
+        if not prepare_window_styles(hwnd):
+            state.log("Failed to prepare window styles", "ERROR")
+            return None, None
+            
+        time.sleep(0.4)
+        
+        if not win32gui.IsWindow(hwnd):
+            state.log("Window destroyed during setup", "WARNING")
+            return None, None
+            
+        try:
+            win32gui.SetWindowPos(
+                hwnd, win32con.HWND_BOTTOM, x, y, w, h,
+                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED |
+                0x0200 | win32con.SWP_SHOWWINDOW
+            )
+        except win32gui.error as e:
+            state.log(f"Error positioning window: {e}", "ERROR")
+            return None, None
+        
+        with state.lock:
+            if p.pid in state.process_info:
+                state.process_info[p.pid]['hwnd'] = hwnd
+                state.process_info[p.pid]['monitor_idx'] = monitor_idx
+        
+        bottom_thread = threading.Thread(target=keep_at_bottom, args=(hwnd,), daemon=True)
+        bottom_thread.start()
+        
+        return hwnd, p
+        
+    except Exception as e:
+        state.log(f"Unexpected error in setup_wallpaper_window: {e}", "ERROR")
+        return None, None
+
+def stop_wallpapers():
+    """Stop all wallpaper processes gracefully"""
+    state.log("Stopping all wallpapers...")
+    
+    with state.lock:
+        all_processes = []
+        for procs in state.processes.values():
+            all_processes.extend(procs)
+        
+        state.processes = {}
+        pids_to_stop = list(state.process_info.keys())
+        state.process_info.clear()
+    
+    for p in all_processes:
+        try:
+            if p and p.pid:
+                ProcessManager.graceful_terminate(p.pid)
+        except Exception as e:
+            state.log(f"Error stopping process {p.pid if p else 'unknown'}: {e}", "ERROR")
+    
+    for pid in pids_to_stop:
+        try:
+            ProcessManager.graceful_terminate(pid)
+        except Exception as e:
+            state.log(f"Error stopping process {pid}: {e}", "ERROR")
+    
+    try:
+        ProcessManager.cleanup_orphaned_mpv()
+    except Exception as e:
+        state.log(f"Error in orphan cleanup: {e}", "ERROR")
+    
+    state.log("All wallpapers stopped")
+
+def instant_switch_monitor(monitor_idx, new_video_idx):
+    """Instant switch for a monitor"""
+    if not state.videos or new_video_idx >= len(state.videos):
+        return False
+        
+    new_video = state.videos[new_video_idx]
+    
+    with state.lock:
+        old_procs = state.processes.get(monitor_idx, [])
+        if monitor_idx in state.processes:
+            del state.processes[monitor_idx]
+    
+    for p in old_procs:
+        try:
+            if p and p.pid:
+                ProcessManager.graceful_terminate(p.pid)
+        except Exception as e:
+            state.log(f"Error terminating old process: {e}", "ERROR")
+    
+    try:
+        x, y, w, h = get_monitor_geometry(monitor_idx)
+        p = launch_mpv(new_video, x, y, w, h)
+        if not p:
+            return False
+            
+        hwnd, p = setup_wallpaper_window(p, monitor_idx)
+        if hwnd:
+            with state.lock:
+                if monitor_idx not in state.processes:
+                    state.processes[monitor_idx] = []
+                state.processes[monitor_idx].append(p)
+            return True
+        else:
+            if p and p.pid:
+                ProcessManager.graceful_terminate(p.pid)
+            return False
+        
+    except Exception as e:
+        state.log(f"Instant switch error: {e}", "ERROR")
+        return False
+
+def crossfade_monitor(monitor_idx, new_video_idx):
+    """Crossfade transition for a monitor"""
+    with state.lock:
+        if state.transition_active:
+            return False
+        state.transition_active = True
+    
+    try:
+        if not state.videos or new_video_idx >= len(state.videos):
+            return False
+            
+        new_video = state.videos[new_video_idx]
+        state.log(f"Monitor {monitor_idx}: Crossfading to {os.path.basename(new_video)}")
+        
+        x, y, w, h = get_monitor_geometry(monitor_idx)
+        
+        with state.lock:
+            old_procs = state.processes.get(monitor_idx, []).copy()
+        
+        new_p = launch_mpv(new_video, x, y, w, h)
+        if not new_p:
+            return False
+            
+        new_hwnd = find_window(new_p.pid, timeout=10)
+        if not new_hwnd:
+            ProcessManager.graceful_terminate(new_p.pid)
+            return False
+            
+        try:
+            win32gui.ShowWindow(new_hwnd, SW_HIDE)
+        except win32gui.error as e:
+            state.log(f"Error hiding new window: {e}", "ERROR")
+            ProcessManager.graceful_terminate(new_p.pid)
+            return False
+            
+        prepare_window_styles(new_hwnd)
+        set_window_opacity(new_hwnd, 0)
+        
+        try:
+            win32gui.SetWindowPos(
+                new_hwnd, win32con.HWND_BOTTOM, x, y, w, h,
+                win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED | 
+                0x0200 | win32con.SWP_SHOWWINDOW
+            )
+        except win32gui.error as e:
+            state.log(f"Error positioning new window: {e}", "ERROR")
+            ProcessManager.graceful_terminate(new_p.pid)
+            return False
+        
+        with state.lock:
+            if monitor_idx not in state.processes:
+                state.processes[monitor_idx] = []
+            state.processes[monitor_idx].append(new_p)
+        
+        threading.Thread(target=keep_at_bottom, args=(new_hwnd,), daemon=True).start()
+        
+        steps = int(state.transition_duration * 60)
+        step_duration = state.transition_duration / steps if steps > 0 else 0.01
+        
+        for i in range(steps + 1):
+            if state.shutting_down:
+                break
+                
+            progress = i / steps
+            eased = progress * progress * (3 - 2 * progress)
+            new_opacity = int(255 * eased)
+            old_opacity = int(255 * (1 - eased))
+            
+            set_window_opacity(new_hwnd, new_opacity)
+            
+            for old_p in old_procs:
+                try:
+                    if old_p and old_p.pid:
+                        old_hwnd = find_window(old_p.pid, timeout=0.1)
+                        if old_hwnd:
+                            set_window_opacity(old_hwnd, old_opacity)
+                except Exception:
+                    pass
+                    
+            time.sleep(step_duration)
+        
+        for old_p in old_procs:
+            try:
+                if old_p and old_p.pid:
+                    ProcessManager.graceful_terminate(old_p.pid)
+            except Exception as e:
+                state.log(f"Error terminating old process: {e}", "ERROR")
+        
+        with state.lock:
+            if monitor_idx in state.processes:
+                state.processes[monitor_idx] = [
+                    p for p in state.processes[monitor_idx] 
+                    if p and p.poll() is None
+                ]
+        
+        return True
+        
+    except Exception as e:
+        state.log(f"Transition error: {e}", "ERROR")
+        return False
+        
+    finally:
+        with state.lock:
+            state.transition_active = False
+
+def start_wallpaper(video=None):
+    """Start wallpaper on all monitors"""
+    if not verify_mpv():
+        return
+        
+    if not state.videos:
+        state.log("No videos in library", "WARNING")
+        return
+    
+    stop_wallpapers()
+    time.sleep(0.2)
+    
+    if video is None:
+        video = state.videos[state.current_index]
+    
+    if state.current_mode == "span":
+        x, y, w, h = get_monitor_geometry()
+        p = launch_mpv(video, x, y, w, h)
+        if p:
+            hwnd, p = setup_wallpaper_window(p, 0)
+            if hwnd:
+                with state.lock:
+                    state.processes = {0: [p]}
+                state.log(f"Started wallpaper: {os.path.basename(video)}")
+    else:
+        for i in range(len(state.monitors)):
+            if state.current_mode == "individual":
+                video_idx = state.monitor_assignments.get(i, i) % len(state.videos)
+            else:
+                video_idx = state.current_index
+                
+            threading.Thread(
+                target=instant_switch_monitor, 
+                args=(i, video_idx), 
+                daemon=True
+            ).start()
+            time.sleep(0.2)
+
+def next_wallpaper():
+    """Switch to next wallpaper"""
+    if not state.videos:
+        return
+        
+    with state.lock:
+        state.current_index = (state.current_index + 1) % len(state.videos)
+        
+        if state.current_mode == "individual":
+            for i in range(len(state.monitors)):
+                new_idx = (state.monitor_assignments.get(i, 0) + 1) % len(state.videos)
+                state.monitor_assignments[i] = new_idx
+                threading.Thread(
+                    target=crossfade_monitor, 
+                    args=(i, new_idx), 
+                    daemon=True
+                ).start()
+        else:
+            QTimer.singleShot(0, lambda: start_wallpaper())
+
+def prev_wallpaper():
+    """Switch to previous wallpaper"""
+    if not state.videos:
+        return
+        
+    with state.lock:
+        state.current_index = (state.current_index - 1) % len(state.videos)
+        
+        if state.current_mode == "individual":
+            for i in range(len(state.monitors)):
+                new_idx = (state.monitor_assignments.get(i, 0) - 1) % len(state.videos)
+                state.monitor_assignments[i] = new_idx
+                threading.Thread(
+                    target=crossfade_monitor, 
+                    args=(i, new_idx), 
+                    daemon=True
+                ).start()
+        else:
+            QTimer.singleShot(0, lambda: start_wallpaper())
+
+def random_wallpaper():
+    """Set random wallpaper (thread-safe)"""
+    if not state.videos:
+        state.log("No videos in library", "WARNING")
+        return
+    
+    if len(state.videos) == 1:
+        state.log("Only one video in library, cannot randomize", "WARNING")
+        return
+    
+    with state.lock:
+        new_index = random.randint(0, len(state.videos) - 1)
+        # Make sure we don't select the same video
+        while len(state.videos) > 1 and new_index == state.current_index:
+            new_index = random.randint(0, len(state.videos) - 1)
+            
+        state.current_index = new_index
+        video_name = os.path.basename(state.videos[new_index])
+        state.log(f"Setting random wallpaper: {video_name}")
+        
+        if state.current_mode == "individual":
+            for i in range(len(state.monitors)):
+                state.monitor_assignments[i] = new_index
+                threading.Thread(
+                    target=crossfade_monitor, 
+                    args=(i, new_index), 
+                    daemon=True
+                ).start()
+        else:
+            QTimer.singleShot(0, lambda: start_wallpaper(state.videos[new_index]))
 
 # ==================== MOEWALLS SCRAPER ====================
 def search_wallpapers(keyword):
+    """Search MoeWalls for wallpapers"""
+    if not keyword or not keyword.strip():
+        return []
+        
     url = f"{BASE_URL}/?s={quote(keyword)}"
-    r = requests.get(url, headers=HEADERS)
-    soup = BeautifulSoup(r.text, "html.parser")
-    results = []
-    for article in soup.find_all("article"):
-        link = article.find("a", href=True)
-        img = article.find("img")
-        if link and img:
-            results.append({"title": img.get("alt", "Wallpaper"), "page": link["href"], "thumbnail": img.get("src")})
-    return results
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            results = []
+            
+            for article in soup.find_all("article"):
+                try:
+                    link = article.find("a", href=True)
+                    img = article.find("img")
+                    if link and img and link.get('href') and img.get('src'):
+                        results.append({
+                            "title": img.get("alt", "Wallpaper"),
+                            "page": link["href"],
+                            "thumbnail": img.get("src")
+                        })
+                except Exception:
+                    continue
+                    
+            return results
+            
+        except requests.Timeout as e:
+            state.log(f"Search timeout (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                raise Exception("Search timed out after multiple attempts")
+        except requests.ConnectionError as e:
+            state.log(f"Connection error (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                raise Exception("Connection failed after multiple attempts")
+        except requests.RequestException as e:
+            state.log(f"Request error (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                raise Exception(f"Search failed: {e}")
 
 def get_download_link(page_url):
-    r = requests.get(page_url, headers=HEADERS)
-    soup = BeautifulSoup(r.text, "html.parser")
-    for a in soup.find_all("a"):
-        if "download" in a.text.lower() and a.get("href"):
-            return a["href"]
-    return None
+    """Get download link from page"""
+    if not page_url:
+        return None
+        
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(page_url, headers=HEADERS, timeout=10)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            for a in soup.find_all("a"):
+                try:
+                    if a.get('href') and "download" in a.text.lower():
+                        return a["href"]
+                except Exception:
+                    continue
+                    
+            return None
+            
+        except requests.Timeout:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                return None
+        except requests.RequestException:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                return None
 
 def download_video(url, progress_callback=None):
+    """Download video with progress"""
+    if not url:
+        raise ValueError("No URL provided")
+        
     filename = url.split("/")[-1].split("?")[0]
-    filepath = os.path.join(SAVE_DIR, filename)
-    r = requests.get(url, headers=HEADERS, stream=True)
-    total = int(r.headers.get('content-length', 0))
-    downloaded = 0
-    with open(filepath, "wb") as f:
-        for chunk in r.iter_content(8192):
-            if chunk:
-                f.write(chunk)
-                downloaded += len(chunk)
-                if progress_callback and total > 0:
-                    progress_callback(int(downloaded * 100 / total))
-    return filepath
+    if not filename.lower().endswith(VIDEO_EXTENSIONS):
+        filename += ".mp4"
+        
+    filepath = os.path.join(state.save_dir, filename)
+    
+    if os.path.exists(filepath):
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(filepath):
+            filepath = os.path.join(state.save_dir, f"{base}_{counter}{ext}")
+            counter += 1
+    
+    temp_path = filepath + ".tmp"
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=HEADERS, stream=True, timeout=30)
+            r.raise_for_status()
+            
+            total = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback and total > 0:
+                            progress_callback(int(downloaded * 100 / total))
+            
+            os.rename(temp_path, filepath)
+            return filepath
+            
+        except requests.Timeout as e:
+            state.log(f"Download timeout (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+            else:
+                raise Exception("Download timed out after multiple attempts")
+        except requests.RequestException as e:
+            state.log(f"Download error (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except Exception:
+                    pass
+            else:
+                raise Exception(f"Download failed: {e}")
+        except (IOError, OSError) as e:
+            state.log(f"File error during download: {e}", "ERROR")
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+            raise Exception(f"File error: {e}")
 
 # ==================== WORKER THREADS ====================
 class SearchThread(QThread):
@@ -920,7 +1473,8 @@ class SearchThread(QThread):
 
     def run(self):
         try:
-            self.finished.emit(search_wallpapers(self.keyword))
+            results = search_wallpapers(self.keyword)
+            self.finished.emit(results)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -937,10 +1491,12 @@ class DownloadThread(QThread):
         try:
             dl_url = get_download_link(self.page_url)
             if not dl_url:
-                self.error.emit("Link not found")
+                self.error.emit("Download link not found")
                 return
+                
             filepath = download_video(dl_url, lambda p: self.progress.emit(p))
             self.finished.emit(filepath)
+            
         except Exception as e:
             self.error.emit(str(e))
 
@@ -949,6 +1505,7 @@ class WallpaperCard(QFrame):
     clicked = pyqtSignal(dict)
     download_clicked = pyqtSignal(dict)
     set_clicked = pyqtSignal(str)
+    delete_clicked = pyqtSignal(str)
 
     def __init__(self, video_path, is_local=True, online_data=None):
         super().__init__()
@@ -958,100 +1515,393 @@ class WallpaperCard(QFrame):
         self.setup_ui()
 
     def setup_ui(self):
-        self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
-        self.thumb_label = QLabel()
-        self.thumb_label.setFixedSize(200, 120)
-        self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if self.is_local:
-            self.thumb_label.setText("🎬")
-            font = self.thumb_label.font()
-            font.setPointSize(24)
-            self.thumb_label.setFont(font)
-        else:
-            self.thumb_label.setText("⬇")
-            self.load_thumbnail()
-        layout.addWidget(self.thumb_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        title = os.path.basename(self.video_path) if self.is_local else self.online_data.get("title", "Unknown")
-        self.title_label = QLabel(title[:30] + "..." if len(title) > 30 else title)
-        self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(self.title_label)
-        btn_layout = QHBoxLayout()
-        if self.is_local:
-            set_btn = QPushButton("Set")
-            set_btn.setObjectName("btnPrimary")
-            set_btn.clicked.connect(lambda: self.set_clicked.emit(self.video_path))
-            btn_layout.addWidget(set_btn)
-        else:
-            dl_btn = QPushButton("Download")
-            dl_btn.setObjectName("btnPrimary")
-            dl_btn.clicked.connect(lambda: self.download_clicked.emit(self.online_data))
-            btn_layout.addWidget(dl_btn)
-        layout.addLayout(btn_layout)
-        self.setFixedWidth(240)
+        try:
+            self.setFrameStyle(QFrame.Shape.StyledPanel | QFrame.Shadow.Raised)
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(8)
+            
+            self.thumb_label = QLabel()
+            self.thumb_label.setFixedSize(200, 120)
+            self.thumb_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.thumb_label.setStyleSheet("background-color: #2d2d2d; border-radius: 4px;")
+            
+            if self.is_local:
+                self.thumb_label.setText("🎬")
+                font = self.thumb_label.font()
+                font.setPointSize(32)
+                self.thumb_label.setFont(font)
+            else:
+                self.thumb_label.setText("⬇")
+                font = self.thumb_label.font()
+                font.setPointSize(32)
+                self.thumb_label.setFont(font)
+                self.load_thumbnail()
+                
+            layout.addWidget(self.thumb_label, alignment=Qt.AlignmentFlag.AlignCenter)
+            
+            if self.is_local:
+                title = os.path.basename(self.video_path)
+            else:
+                title = self.online_data.get("title", "Unknown") if self.online_data else "Unknown"
+                
+            display_title = title[:25] + "..." if len(title) > 25 else title
+            self.title_label = QLabel(display_title)
+            self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.title_label.setWordWrap(True)
+            self.title_label.setToolTip(title)
+            layout.addWidget(self.title_label)
+            
+            btn_layout = QHBoxLayout()
+            
+            if self.is_local:
+                set_btn = QPushButton("Set")
+                set_btn.clicked.connect(lambda: self.set_clicked.emit(self.video_path))
+                set_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_layout.addWidget(set_btn)
+                
+                delete_btn = QPushButton("🗑️")
+                delete_btn.setMaximumWidth(30)
+                delete_btn.clicked.connect(lambda: self.delete_clicked.emit(self.video_path))
+                delete_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                delete_btn.setToolTip("Delete from library")
+                btn_layout.addWidget(delete_btn)
+            else:
+                dl_btn = QPushButton("Download")
+                dl_btn.clicked.connect(lambda: self.download_clicked.emit(self.online_data))
+                dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_layout.addWidget(dl_btn)
+            
+            layout.addLayout(btn_layout)
+            
+            self.setFixedWidth(240)
+            
+        except Exception as e:
+            state.log(f"Error setting up wallpaper card: {e}", "ERROR")
 
     def load_thumbnail(self):
         def fetch():
             try:
+                if not self.online_data:
+                    return
+                    
                 url = self.online_data.get("thumbnail")
-                if url:
-                    r = requests.get(url, headers=HEADERS)
-                    img = Image.open(BytesIO(r.content))
-                    img = img.resize((200, 120), Image.Resampling.LANCZOS)
-                    img_bytes = BytesIO()
-                    img.save(img_bytes, format='PNG')
-                    pixmap = QPixmap()
-                    pixmap.loadFromData(img_bytes.getvalue())
-                    self.thumb_label.setPixmap(pixmap)
-            except:
-                self.thumb_label.setText("❌")
+                if not url:
+                    return
+                    
+                r = requests.get(url, headers=HEADERS, timeout=5)
+                r.raise_for_status()
+                
+                img = Image.open(BytesIO(r.content))
+                img = img.resize((200, 120), Image.Resampling.LANCZOS)
+                
+                img_bytes = BytesIO()
+                img.save(img_bytes, format='PNG')
+                pixmap = QPixmap()
+                pixmap.loadFromData(img_bytes.getvalue())
+                
+                self.thumb_label.setPixmap(pixmap)
+                
+            except requests.RequestException:
+                pass
+            except Exception:
+                pass
+                
         threading.Thread(target=fetch, daemon=True).start()
 
     def mousePressEvent(self, event):
-        self.clicked.emit({"path": self.video_path, "is_local": self.is_local, "data": self.online_data})
+        try:
+            self.clicked.emit({
+                "path": self.video_path, 
+                "is_local": self.is_local, 
+                "data": self.online_data
+            })
+        except Exception as e:
+            state.log(f"Error in mouse press event: {e}", "ERROR")
+
+class SettingsTab(QWidget):
+    """Settings tab for configuring application behavior"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+        self.load_settings()
+        state.settings_tab = self
+    
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        
+        # Video Storage Location
+        storage_box = QGroupBox("Video Storage Location")
+        storage_layout = QVBoxLayout(storage_box)
+        
+        self.path_label = QLabel(f"Current: {SAVE_DIR}")
+        self.path_label.setWordWrap(True)
+        self.path_label.setStyleSheet("padding: 5px; background-color: #2d2d2d; border-radius: 3px;")
+        storage_layout.addWidget(self.path_label)
+        
+        change_btn = QPushButton("Change Location")
+        change_btn.clicked.connect(self.change_location)
+        change_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        storage_layout.addWidget(change_btn)
+        
+        info_label = QLabel(
+            "Note: Changing location will:\n"
+            "• Move configuration files to new location\n"
+            "• Optionally copy existing videos\n"
+            "• Require application restart"
+        )
+        info_label.setStyleSheet("color: #888; font-style: italic; padding: 5px;")
+        storage_layout.addWidget(info_label)
+        
+        layout.addWidget(storage_box)
+        
+        # Additional Library Paths
+        paths_box = QGroupBox("Additional Library Folders")
+        paths_layout = QVBoxLayout(paths_box)
+        
+        self.paths_list = QListWidget()
+        self.paths_list.setMaximumHeight(150)
+        paths_layout.addWidget(self.paths_list)
+        
+        path_buttons = QHBoxLayout()
+        
+        add_path_btn = QPushButton("Add Folder")
+        add_path_btn.clicked.connect(self.add_library_path)
+        add_path_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        path_buttons.addWidget(add_path_btn)
+        
+        remove_path_btn = QPushButton("Remove Selected")
+        remove_path_btn.clicked.connect(self.remove_library_path)
+        remove_path_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        path_buttons.addWidget(remove_path_btn)
+        
+        paths_layout.addLayout(path_buttons)
+        
+        self.subfolders_check = QCheckBox("Include videos from subfolders")
+        self.subfolders_check.stateChanged.connect(self.toggle_subfolders)
+        paths_layout.addWidget(self.subfolders_check)
+        
+        layout.addWidget(paths_box)
+        
+        # Library Statistics
+        stats_box = QGroupBox("Library Statistics")
+        stats_layout = QVBoxLayout(stats_box)
+        
+        self.stats_label = QLabel("Loading statistics...")
+        stats_layout.addWidget(self.stats_label)
+        
+        refresh_stats_btn = QPushButton("Refresh Statistics")
+        refresh_stats_btn.clicked.connect(self.update_statistics)
+        refresh_stats_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        stats_layout.addWidget(refresh_stats_btn)
+        
+        layout.addWidget(stats_box)
+        
+               
+        # About
+        about_box = QGroupBox("About")
+        about_layout = QVBoxLayout(about_box)
+        
+        about_text = QLabel(
+            "Video Wallpaper Manager v2.2\n"
+            "Configurable storage location\n"
+            "Supports multiple library folders\n"
+            "MPV player required"
+        )
+        about_layout.addWidget(about_text)
+        
+        layout.addWidget(about_box)
+        layout.addStretch()
+    
+    def load_settings(self):
+        """Load settings into UI"""
+        settings = load_settings()
+        
+        self.paths_list.clear()
+        for path in state.library_paths:
+            self.paths_list.addItem(path)
+        
+        self.subfolders_check.setChecked(settings.get("check_subfolders", False))
+        self.update_statistics()
+    
+    def update_statistics(self):
+        """Update library statistics"""
+        total_size = 0
+        video_count = len(state.videos)
+        
+        for video in state.videos:
+            try:
+                total_size += os.path.getsize(video)
+            except:
+                pass
+        
+        if total_size > 1024**3:
+            size_str = f"{total_size / (1024**3):.2f} GB"
+        elif total_size > 1024**2:
+            size_str = f"{total_size / (1024**2):.2f} MB"
+        else:
+            size_str = f"{total_size / 1024:.2f} KB"
+        
+        stats_text = (
+            f"Total videos: {video_count}\n"
+            f"Total size: {size_str}\n"
+            f"Main folder: {state.save_dir}\n"
+            f"Additional folders: {len(state.library_paths)}"
+        )
+        
+        self.stats_label.setText(stats_text)
+    
+    def debug_auto_change(self):
+        """Debug auto-change settings"""
+        debug_msg = (
+            f"Auto-change enabled: {state.auto_change_enabled}\n"
+            f"Interval (seconds): {state.auto_change_interval}\n"
+            f"Interval (minutes): {state.auto_change_interval // 60}\n"
+            f"Videos count: {len(state.videos)}\n"
+            f"Thread running: {state.auto_change_thread.isRunning() if state.auto_change_thread else False}"
+        )
+        QMessageBox.information(self, "Auto-Change Debug", debug_msg)
+    
+    def change_location(self):
+        """Change video storage location"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Videos Folder",
+            os.path.expanduser("~\\Videos"),
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if folder:
+            reply = QMessageBox.question(
+                self,
+                "Change Storage Location",
+                f"Change storage location to:\n{folder}\n\n"
+                "This will move configuration files and optionally copy videos.\n"
+                "The application will need to restart.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                if change_video_storage_location(folder):
+                    QMessageBox.information(
+                        self,
+                        "Restart Required",
+                        "Storage location changed successfully.\nPlease restart the application."
+                    )
+                    self.path_label.setText(f"Current: {folder}")
+                    self.update_statistics()
+    
+    def add_library_path(self):
+        """Add additional library path"""
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Folder to Add to Library",
+            os.path.expanduser("~"),
+            QFileDialog.Option.ShowDirsOnly
+        )
+        
+        if folder:
+            if add_library_path(folder):
+                self.paths_list.addItem(folder)
+                self.update_statistics()
+                if state.library_tab:
+                    state.library_tab.refresh_library()
+                QMessageBox.information(self, "Success", f"Added folder: {folder}")
+            else:
+                QMessageBox.warning(self, "Error", "Failed to add folder (already exists or invalid)")
+    
+    def remove_library_path(self):
+        """Remove selected library path"""
+        current_item = self.paths_list.currentItem()
+        if current_item:
+            path = current_item.text()
+            reply = QMessageBox.question(
+                self,
+                "Remove Folder",
+                f"Remove '{path}' from library?\n\nVideos will not be deleted, just removed from library.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            
+            if reply == QMessageBox.StandardButton.Yes:
+                if remove_library_path(path):
+                    self.paths_list.takeItem(self.paths_list.row(current_item))
+                    self.update_statistics()
+                    if state.library_tab:
+                        state.library_tab.refresh_library()
+    
+    def toggle_subfolders(self, state_val):
+        """Toggle subfolder scanning"""
+        settings = load_settings()
+        settings["check_subfolders"] = bool(state_val)
+        save_settings(settings)
+        
+        load_videos()
+        if state.library_tab:
+            state.library_tab.refresh_library()
+        self.update_statistics()
 
 class MoeWallsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent = parent
         self.search_results = []
+        self.search_thread = None
+        self.download_thread = None
         self.setup_ui()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
+        
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search anime wallpapers...")
         self.search_input.returnPressed.connect(self.do_search)
         search_layout.addWidget(self.search_input)
+        
         self.search_btn = QPushButton("🔍 Search")
-        self.search_btn.setObjectName("btnPrimary")
         self.search_btn.clicked.connect(self.do_search)
+        self.search_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         search_layout.addWidget(self.search_btn)
+        
         layout.addLayout(search_layout)
+        
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
+        
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameStyle(QFrame.Shape.NoFrame)
+        
         self.results_container = QWidget()
         self.results_layout = QGridLayout(self.results_container)
         self.results_layout.setSpacing(15)
         self.results_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        
         scroll.setWidget(self.results_container)
         layout.addWidget(scroll)
+        
         self.status_label = QLabel("Enter a search term to find wallpapers")
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status_label.setStyleSheet("color: #888; padding: 20px;")
         layout.addWidget(self.status_label)
 
     def do_search(self):
         keyword = self.search_input.text().strip()
         if not keyword:
             return
+            
         self.status_label.setText(f"Searching for '{keyword}'...")
         self.search_btn.setEnabled(False)
+        
+        if self.search_thread and self.search_thread.isRunning():
+            self.search_thread.terminate()
+            self.search_thread.wait()
+        
         self.search_thread = SearchThread(keyword)
         self.search_thread.finished.connect(self.on_search_finished)
         self.search_thread.error.connect(self.on_search_error)
@@ -1060,18 +1910,28 @@ class MoeWallsTab(QWidget):
     def on_search_finished(self, results):
         self.search_btn.setEnabled(True)
         self.search_results = results
-        while self.results_layout.count():
-            item = self.results_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        
+        try:
+            while self.results_layout.count():
+                item = self.results_layout.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+        except Exception as e:
+            state.log(f"Error clearing results: {e}", "ERROR")
+        
         if not results:
             self.status_label.setText("No results found.")
             return
+            
         self.status_label.setText(f"Found {len(results)} wallpapers")
+        
         for i, result in enumerate(results):
-            card = WallpaperCard(video_path=result["page"], is_local=False, online_data=result)
-            card.download_clicked.connect(self.start_download)
-            self.results_layout.addWidget(card, i // 3, i % 3)
+            try:
+                card = WallpaperCard(video_path=result["page"], is_local=False, online_data=result)
+                card.download_clicked.connect(self.start_download)
+                self.results_layout.addWidget(card, i // 3, i % 3)
+            except Exception as e:
+                state.log(f"Error creating result card: {e}", "ERROR")
 
     def on_search_error(self, error):
         self.search_btn.setEnabled(True)
@@ -1081,6 +1941,11 @@ class MoeWallsTab(QWidget):
     def start_download(self, data):
         self.progress.setVisible(True)
         self.progress.setValue(0)
+        
+        if self.download_thread and self.download_thread.isRunning():
+            self.download_thread.terminate()
+            self.download_thread.wait()
+        
         self.download_thread = DownloadThread(data["page"])
         self.download_thread.progress.connect(self.progress.setValue)
         self.download_thread.finished.connect(self.on_download_finished)
@@ -1091,9 +1956,14 @@ class MoeWallsTab(QWidget):
         self.progress.setVisible(False)
         state.log(f"Downloaded: {os.path.basename(filepath)}")
         load_videos()
-        if self.parent:
-            self.parent.refresh_library()
-        QMessageBox.information(self, "Download Complete", f"Saved to: {os.path.basename(filepath)}")
+        
+        if state.library_tab:
+            state.library_tab.refresh_library()
+        if state.settings_tab:
+            state.settings_tab.update_statistics()
+            
+        QMessageBox.information(self, "Download Complete", 
+                               f"Saved to: {os.path.basename(filepath)}")
 
     def on_download_error(self, error):
         self.progress.setVisible(False)
@@ -1102,98 +1972,201 @@ class MoeWallsTab(QWidget):
 class LibraryTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent = parent
         self.setup_ui()
         self.refresh_library()
+        state.library_tab = self
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
+        
         controls = QHBoxLayout()
+        
         self.info_label = QLabel("0 videos in library")
+        self.info_label.setStyleSheet("font-weight: bold;")
         controls.addWidget(self.info_label)
+        
         controls.addStretch()
+        
         add_btn = QPushButton("+ Add Videos")
-        add_btn.setObjectName("btnSecondary")
         add_btn.clicked.connect(self.add_videos)
+        add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         controls.addWidget(add_btn)
+        
         open_btn = QPushButton("📁 Open Folder")
-        open_btn.setObjectName("btnSecondary")
         open_btn.clicked.connect(self.open_folder)
+        open_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         controls.addWidget(open_btn)
+        
         layout.addLayout(controls)
+        
+        self.paths_info_label = QLabel(f"Main library: {SAVE_DIR}")
+        self.paths_info_label.setWordWrap(True)
+        self.paths_info_label.setStyleSheet("color: #888; font-size: 10pt; padding: 5px;")
+        layout.addWidget(self.paths_info_label)
+        
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setFrameStyle(QFrame.Shape.NoFrame)
+        
         self.library_container = QWidget()
         self.library_layout = QGridLayout(self.library_container)
         self.library_layout.setSpacing(15)
         self.library_layout.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        
         scroll.setWidget(self.library_container)
         layout.addWidget(scroll)
+        
         actions_box = QGroupBox("Quick Actions")
         actions_layout = QHBoxLayout(actions_box)
+        
         prev_btn = QPushButton("⏮ Previous")
-        prev_btn.setObjectName("btnSecondary")
         prev_btn.clicked.connect(prev_wallpaper)
+        prev_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         actions_layout.addWidget(prev_btn)
+        
         next_btn = QPushButton("▶ Next Wallpaper")
-        next_btn.setObjectName("btnPrimary")
         next_btn.clicked.connect(next_wallpaper)
+        next_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         actions_layout.addWidget(next_btn)
+        
         random_btn = QPushButton("🔀 Random")
-        random_btn.setObjectName("btnSecondary")
         random_btn.clicked.connect(random_wallpaper)
+        random_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         actions_layout.addWidget(random_btn)
+        
+        stop_btn = QPushButton("⏹ Stop All")
+        stop_btn.clicked.connect(stop_wallpapers)
+        stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        actions_layout.addWidget(stop_btn)
+        
+        refresh_btn = QPushButton("🔄 Refresh")
+        refresh_btn.clicked.connect(self.refresh_library)
+        refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        actions_layout.addWidget(refresh_btn)
+        
         layout.addWidget(actions_box)
 
     def refresh_library(self):
-        while self.library_layout.count():
-            item = self.library_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        """Refresh library display"""
+        try:
+            while self.library_layout.count():
+                item = self.library_layout.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+        except Exception as e:
+            state.log(f"Error clearing library: {e}", "ERROR")
+        
         load_videos()
         self.info_label.setText(f"{len(state.videos)} video(s) in library")
+        
+        paths_text = f"Main library: {SAVE_DIR}"
+        if state.library_paths:
+            paths_text += f"\nAdditional folders: {len(state.library_paths)}"
+        self.paths_info_label.setText(paths_text)
+        
+        if not state.videos:
+            placeholder = QLabel("No videos in library.\nClick 'Add Videos' to add files.")
+            placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            placeholder.setStyleSheet("color: #888; padding: 50px;")
+            self.library_layout.addWidget(placeholder, 0, 0)
+            return
+        
         for i, video_path in enumerate(state.videos):
-            card = WallpaperCard(video_path, is_local=True)
-            card.set_clicked.connect(self.set_wallpaper)
-            self.library_layout.addWidget(card, i // 3, i % 3)
+            try:
+                card = WallpaperCard(video_path, is_local=True)
+                card.set_clicked.connect(self.set_wallpaper)
+                card.delete_clicked.connect(self.delete_video)
+                self.library_layout.addWidget(card, i // 3, i % 3)
+            except Exception as e:
+                state.log(f"Error creating library card: {e}", "ERROR")
 
     def set_wallpaper(self, video_path):
+        """Set selected video as wallpaper"""
         try:
             idx = state.videos.index(video_path)
             state.current_index = idx
+            
             if state.current_mode == "individual":
                 for i in range(len(state.monitors)):
                     state.monitor_assignments[i] = idx
                     threading.Thread(target=crossfade_monitor, args=(i, idx), daemon=True).start()
             else:
                 start_wallpaper(video_path)
-        except:
-            pass
+                
+        except ValueError as e:
+            state.log(f"Video not found in library: {e}", "ERROR")
+            QMessageBox.warning(self, "Error", "Video not found in library")
+        except Exception as e:
+            state.log(f"Error setting wallpaper: {e}", "ERROR")
+            QMessageBox.warning(self, "Error", f"Failed to set wallpaper: {e}")
+
+    def delete_video(self, video_path):
+        """Delete video from library"""
+        reply = QMessageBox.question(
+            self, 
+            "Confirm Delete",
+            f"Are you sure you want to delete '{os.path.basename(video_path)}'?\n\nThis will permanently remove the file.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                if os.path.exists(video_path):
+                    os.remove(video_path)
+                    state.log(f"Deleted video: {os.path.basename(video_path)}")
+                    self.refresh_library()
+                    
+                    if state.settings_tab:
+                        state.settings_tab.update_statistics()
+            except Exception as e:
+                state.log(f"Error deleting video: {e}", "ERROR")
+                QMessageBox.warning(self, "Error", f"Failed to delete video: {e}")
 
     def add_videos(self):
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Videos", "", "Videos (*.mp4 *.webm *.mkv)")
+        """Add videos to library"""
+        files, _ = QFileDialog.getOpenFileNames(
+            self, 
+            "Select Videos", 
+            "", 
+            "Videos (*.mp4 *.webm *.mkv)"
+        )
+        
         if files:
-            import shutil
             added = 0
+            failed = 0
+            
             for f in files:
-                dest = os.path.join(SAVE_DIR, os.path.basename(f))
-                if not os.path.exists(dest):
-                    shutil.copy2(f, dest)
+                result = add_video_to_library(f)
+                if result:
                     added += 1
+                else:
+                    failed += 1
+            
             if added > 0:
                 self.refresh_library()
-                QMessageBox.information(self, "Success", f"Added {added} video(s)")
+                
+                if state.settings_tab:
+                    state.settings_tab.update_statistics()
+                
+                msg = f"Added {added} video(s)"
+                if failed > 0:
+                    msg += f" ({failed} failed)"
+                QMessageBox.information(self, "Success", msg)
 
     def open_folder(self):
-        if not os.path.exists(SAVE_DIR):
-            os.makedirs(SAVE_DIR)
-        os.startfile(SAVE_DIR)
+        """Open videos folder"""
+        try:
+            if not os.path.exists(SAVE_DIR):
+                os.makedirs(SAVE_DIR)
+            os.startfile(SAVE_DIR)
+        except Exception as e:
+            state.log(f"Error opening folder: {e}", "ERROR")
+            QMessageBox.warning(self, "Error", f"Failed to open folder: {e}")
 
 class DisplayTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.parent = parent
         self.setup_ui()
         self.load_settings()
 
@@ -1201,114 +2174,44 @@ class DisplayTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(20)
 
-        # Theme
         theme_box = QGroupBox("Interface Theme")
         theme_layout = QHBoxLayout(theme_box)
+        
         theme_label = QLabel("Select Theme:")
         theme_layout.addWidget(theme_label)
+        
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(list(ThemeManager.THEMES.keys()))
+        self.theme_combo.addItems(["Dark", "Light", "Dracula", "Nord", "Midnight"])
         self.theme_combo.currentTextChanged.connect(self.on_theme_changed)
         theme_layout.addWidget(self.theme_combo)
         theme_layout.addStretch()
+        
         layout.addWidget(theme_box)
 
-        # Visualizer
-        vis_box = QGroupBox("Audio Visualizer")
-        vis_layout = QVBoxLayout(vis_box)
-        row1 = QHBoxLayout()
-        self.vis_check = QCheckBox("Enable")
-        self.vis_check.setChecked(state.visualizer_enabled)
-        self.vis_check.stateChanged.connect(self.on_vis_toggled)
-        row1.addWidget(self.vis_check)
-        row1.addWidget(QLabel("Style:"))
-        self.vis_style_combo = QComboBox()
-        self.vis_style_combo.addItems(["Bars", "Slim", "Wave", "Wave Dots", "Radial"])
-        self.vis_style_combo.setCurrentText(state.visualizer_style)
-        self.vis_style_combo.currentTextChanged.connect(self.on_vis_style_changed)
-        row1.addWidget(self.vis_style_combo)
-        row1.addStretch()
-        vis_layout.addLayout(row1)
-        row2 = QHBoxLayout()
-        self.rainbow_check = QCheckBox("Rainbow Mode")
-        self.rainbow_check.setChecked(state.visualizer_rainbow)
-        self.rainbow_check.stateChanged.connect(self.on_rainbow_toggled)
-        row2.addWidget(self.rainbow_check)
-        row2.addWidget(QLabel("Width:"))
-        self.width_spin = QSpinBox()
-        self.width_spin.setRange(1, 20)
-        self.width_spin.setValue(state.visualizer_bar_width)
-        self.width_spin.valueChanged.connect(self.on_width_changed)
-        row2.addWidget(self.width_spin)
-        row2.addStretch()
-        vis_layout.addLayout(row2)
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("Bars:"))
-        self.vis_bars_spin = QSpinBox()
-        self.vis_bars_spin.setRange(16, 200)
-        self.vis_bars_spin.setValue(state.visualizer_bars)
-        self.vis_bars_spin.valueChanged.connect(self.on_vis_bars_changed)
-        row3.addWidget(self.vis_bars_spin)
-        row3.addWidget(QLabel("Height/Size:"))
-        self.vis_height_spin = QSpinBox()
-        self.vis_height_spin.setRange(30, 300)
-        self.vis_height_spin.setValue(state.visualizer_height)
-        self.vis_height_spin.valueChanged.connect(self.on_vis_height_changed)
-        row3.addWidget(self.vis_height_spin)
-        row3.addStretch()
-        vis_layout.addLayout(row3)
-        if not AUDIO_VIS_AVAILABLE:
-            self.vis_check.setEnabled(False)
-            err_label = QLabel("Requires: pip install pyaudiowpatch numpy")
-            err_label.setStyleSheet("color: red;")
-            vis_layout.addWidget(err_label)
-        layout.addWidget(vis_box)
-
-        # Keyboard Shortcuts
-        shortcut_box = QGroupBox("Keyboard Shortcuts")
-        shortcut_layout = QVBoxLayout(shortcut_box)
-
-        self.shortcut_check = QCheckBox("Enable Keyboard Shortcuts")
-        self.shortcut_check.setChecked(state.shortcuts_enabled)
-        self.shortcut_check.stateChanged.connect(self.on_shortcut_toggled)
-        shortcut_layout.addWidget(self.shortcut_check)
-
-        info_layout = QGridLayout()
-        info_layout.addWidget(QLabel("Next Wallpaper:"), 0, 0)
-        info_layout.addWidget(QLabel("Ctrl + Shift + N"), 0, 1)
-        info_layout.addWidget(QLabel("Previous Wallpaper:"), 1, 0)
-        info_layout.addWidget(QLabel("Ctrl + Shift + P"), 1, 1)
-        info_layout.addWidget(QLabel("Random Wallpaper:"), 2, 0)
-        info_layout.addWidget(QLabel("Ctrl + Shift + R"), 2, 1)
-        info_layout.addWidget(QLabel("Toggle Visualizer:"), 3, 0)
-        info_layout.addWidget(QLabel("Ctrl + Shift + T"), 3, 1)
-        shortcut_layout.addLayout(info_layout)
-
-        if not PYNPUT_AVAILABLE:
-            warn_label = QLabel("⚠️ Requires: pip install pynput")
-            warn_label.setStyleSheet("color: orange;")
-            shortcut_layout.addWidget(warn_label)
-            self.shortcut_check.setEnabled(False)
-
-        layout.addWidget(shortcut_box)
-
-        # Display Mode
         mode_box = QGroupBox("Display Mode")
         mode_layout = QVBoxLayout(mode_box)
+        
         self.mode_group = QButtonGroup(self)
-        modes = [("span", "Span", "One video across all monitors"),
-                 ("duplicate", "Duplicate", "Same video on all monitors"),
-                 ("individual", "Individual", "Different video per monitor")]
+        modes = [
+            ("span", "Span", "One video stretched across all monitors"),
+            ("duplicate", "Duplicate", "Same video on all monitors"),
+            ("individual", "Individual", "Different video per monitor")
+        ]
+        
         for value, name, desc in modes:
             row = QHBoxLayout()
             rb = QRadioButton(name)
             rb.mode_value = value
             self.mode_group.addButton(rb)
             row.addWidget(rb)
+            
             lbl = QLabel(desc)
+            lbl.setStyleSheet("color: #888;")
             row.addWidget(lbl)
             row.addStretch()
+            
             mode_layout.addLayout(row)
+            
         self.mode_group.buttonClicked.connect(self.on_mode_changed)
         layout.addWidget(mode_box)
 
@@ -1317,326 +2220,415 @@ class DisplayTab(QWidget):
         self.monitor_box.setVisible(False)
         layout.addWidget(self.monitor_box)
 
-        # Transitions
         trans_box = QGroupBox("Transition Effects")
         trans_layout = QVBoxLayout(trans_box)
+        
         duration_row = QHBoxLayout()
         duration_row.addWidget(QLabel("Duration:"))
+        
         self.duration_slider = QSlider(Qt.Orientation.Horizontal)
         self.duration_slider.setRange(5, 30)
         self.duration_slider.setValue(12)
         self.duration_slider.valueChanged.connect(self.on_duration_changed)
         duration_row.addWidget(self.duration_slider)
+        
         self.duration_label = QLabel("1.2s")
+        self.duration_label.setMinimumWidth(40)
         duration_row.addWidget(self.duration_label)
+        
         trans_layout.addLayout(duration_row)
+        
         test_btn = QPushButton("▶ Test Transition")
-        test_btn.setObjectName("btnPrimary")
         test_btn.clicked.connect(self.test_transition)
+        test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         trans_layout.addWidget(test_btn)
+        
         layout.addWidget(trans_box)
 
-        # Auto Change
         auto_box = QGroupBox("Auto-Change Timer")
         auto_layout = QVBoxLayout(auto_box)
+        
         self.auto_check = QCheckBox("Enable Auto-Change")
         self.auto_check.stateChanged.connect(self.on_auto_changed)
         auto_layout.addWidget(self.auto_check)
+        
         interval_row = QHBoxLayout()
         interval_row.addWidget(QLabel("Interval (minutes):"))
+        
         self.interval_spin = QSpinBox()
         self.interval_spin.setRange(1, 120)
         self.interval_spin.setValue(5)
         self.interval_spin.valueChanged.connect(self.on_interval_changed)
         interval_row.addWidget(self.interval_spin)
         interval_row.addStretch()
+        
         auto_layout.addLayout(interval_row)
         layout.addWidget(auto_box)
 
+        info_box = QGroupBox("Monitor Information")
+        info_layout = QVBoxLayout(info_box)
+        
+        for i, m in enumerate(state.monitors):
+            primary = " (Primary)" if m.get('is_primary', False) else ""
+            info = f"Monitor {i+1}{primary}: {m['width']}x{m['height']} at ({m['x']}, {m['y']})"
+            info_layout.addWidget(QLabel(info))
+        
+        layout.addWidget(info_box)
         layout.addStretch()
 
     def load_settings(self):
-        idx = self.theme_combo.findText(state.theme)
-        if idx >= 0:
-            self.theme_combo.setCurrentIndex(idx)
-        for btn in self.mode_group.buttons():
-            if btn.mode_value == state.current_mode:
-                btn.setChecked(True)
-                break
-        self.duration_slider.setValue(int(state.transition_duration * 10))
-        self.auto_check.setChecked(state.auto_change_enabled)
-        self.interval_spin.setValue(state.auto_change_interval // 60)
-        self.refresh_monitor_assignment()
+        """Load settings into UI"""
+        try:
+            idx = self.theme_combo.findText(state.theme)
+            if idx >= 0:
+                self.theme_combo.setCurrentIndex(idx)
+            
+            for btn in self.mode_group.buttons():
+                if hasattr(btn, 'mode_value') and btn.mode_value == state.current_mode:
+                    btn.setChecked(True)
+                    break
+            
+            self.duration_slider.setValue(int(state.transition_duration * 10))
+            
+            self.auto_check.setChecked(state.auto_change_enabled)
+            self.interval_spin.setValue(state.auto_change_interval // 60)
+            
+            self.refresh_monitor_assignment()
+            
+        except Exception as e:
+            state.log(f"Error loading settings into UI: {e}", "ERROR")
 
     def refresh_monitor_assignment(self):
-        while self.monitor_layout.count():
-            item = self.monitor_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
+        """Refresh per-monitor assignment UI"""
+        try:
+            while self.monitor_layout.count():
+                item = self.monitor_layout.takeAt(0)
+                if item and item.widget():
+                    item.widget().deleteLater()
+        except Exception as e:
+            state.log(f"Error clearing monitor layout: {e}", "ERROR")
+        
         if state.current_mode != "individual" or len(state.monitors) <= 1:
             self.monitor_box.setVisible(False)
             return
+            
         self.monitor_box.setVisible(True)
+        
         for i, m in enumerate(state.monitors):
-            row = QHBoxLayout()
-            info = f"Monitor {i+1} - {m['width']}x{m['height']}"
-            row.addWidget(QLabel(info))
-            combo = QComboBox()
-            for v in state.videos:
-                combo.addItem(os.path.basename(v))
-            current = state.monitor_assignments.get(i, i) % len(state.videos) if state.videos else 0
-            combo.setCurrentIndex(current)
-            combo.currentIndexChanged.connect(lambda idx, mon=i: self.on_monitor_video_changed(mon, idx))
-            row.addWidget(combo)
-            self.monitor_layout.addLayout(row)
+            try:
+                row = QHBoxLayout()
+                
+                info = f"Monitor {i+1} - {m['width']}x{m['height']}"
+                row.addWidget(QLabel(info))
+                
+                combo = QComboBox()
+                for v in state.videos:
+                    combo.addItem(os.path.basename(v))
+                
+                current = state.monitor_assignments.get(i, i) % len(state.videos) if state.videos else 0
+                combo.setCurrentIndex(current)
+                
+                combo.currentIndexChanged.connect(
+                    lambda idx, mon=i: self.on_monitor_video_changed(mon, idx)
+                )
+                
+                row.addWidget(combo)
+                self.monitor_layout.addLayout(row)
+                
+            except Exception as e:
+                state.log(f"Error creating monitor control for monitor {i}: {e}", "ERROR")
 
     def on_theme_changed(self, theme_name):
-        state.theme = theme_name
-        save_config()
-        if self.parent:
-            self.parent.apply_theme(theme_name)
-
-    def on_vis_toggled(self, state_val):
-        state.visualizer_enabled = bool(state_val)
-        save_config()
-        if self.parent:
-            self.parent.toggle_visualizer(state.visualizer_enabled)
-
-    def on_vis_style_changed(self, style):
-        state.visualizer_style = style
-        save_config()
-        if self.parent and hasattr(self.parent, 'visualizer_window') and self.parent.visualizer_window:
-            self.parent.visualizer_window.style = style
-            self.parent.visualizer_window.resize_screen()
-
-    def on_rainbow_toggled(self, state_val):
-        state.visualizer_rainbow = bool(state_val)
-        save_config()
-
-    def on_width_changed(self, val):
-        state.visualizer_bar_width = val
-        save_config()
-
-    def on_vis_bars_changed(self, val):
-        state.visualizer_bars = val
-        save_config()
-        if self.parent and hasattr(self.parent, 'visualizer_window') and self.parent.visualizer_window:
-            self.parent.visualizer_window.bars = val
-            self.parent.visualizer_window.audio_data = np.zeros(val)
-
-    def on_vis_height_changed(self, val):
-        state.visualizer_height = val
-        save_config()
-        if self.parent and hasattr(self.parent, 'visualizer_window') and self.parent.visualizer_window:
-            self.parent.visualizer_window.height_factor = val
-            self.parent.visualizer_window.resize_screen()
-
-    def on_shortcut_toggled(self, state_val):
-        state.shortcuts_enabled = bool(state_val)
-        save_config()
-        if self.parent and hasattr(self.parent, 'keyboard_handler'):
-            self.parent.keyboard_handler.stop()
-            if state.shortcuts_enabled and PYNPUT_AVAILABLE:
-                self.parent.keyboard_handler.start()
+        """Handle theme change"""
+        try:
+            state.theme = theme_name
+            save_config()
+            if self.window():
+                self.window().apply_theme(theme_name)
+        except Exception as e:
+            state.log(f"Error changing theme: {e}", "ERROR")
 
     def on_mode_changed(self, btn):
-        state.current_mode = btn.mode_value
-        save_config()
-        self.refresh_monitor_assignment()
-        start_wallpaper()
+        """Handle display mode change"""
+        try:
+            if hasattr(btn, 'mode_value'):
+                state.current_mode = btn.mode_value
+                save_config()
+                self.refresh_monitor_assignment()
+                start_wallpaper()
+        except Exception as e:
+            state.log(f"Error changing mode: {e}", "ERROR")
 
     def on_duration_changed(self, value):
-        seconds = value / 10.0
-        state.transition_duration = seconds
-        self.duration_label.setText(f"{seconds:.1f}s")
-        save_config()
+        """Handle transition duration change"""
+        try:
+            seconds = value / 10.0
+            state.transition_duration = seconds
+            self.duration_label.setText(f"{seconds:.1f}s")
+            save_config()
+        except Exception as e:
+            state.log(f"Error changing duration: {e}", "ERROR")
 
     def on_auto_changed(self, state_val):
-        state.auto_change_enabled = bool(state_val)
-        save_config()
+        """Handle auto-change toggle"""
+        try:
+            enabled = bool(state_val)
+            state.auto_change_enabled = enabled
+            save_config()
+            state.log(f"Auto-change {'enabled' if enabled else 'disabled'}")
+        except Exception as e:
+            state.log(f"Error toggling auto-change: {e}", "ERROR")
 
     def on_interval_changed(self, value):
-        state.auto_change_interval = value * 60
-        save_config()
+        """Handle interval change"""
+        try:
+            value = max(1, min(120, value))
+            state.auto_change_interval = value * 60
+            save_config()
+            state.log(f"Auto-change interval set to {value} minutes")
+        except Exception as e:
+            state.log(f"Error changing interval: {e}", "ERROR")
 
     def on_monitor_video_changed(self, monitor_idx, video_idx):
-        if 0 <= video_idx < len(state.videos):
-            state.monitor_assignments[monitor_idx] = video_idx
-            save_config()
-            threading.Thread(target=crossfade_monitor, args=(monitor_idx, video_idx), daemon=True).start()
+        """Handle per-monitor video selection"""
+        try:
+            if 0 <= video_idx < len(state.videos):
+                state.monitor_assignments[monitor_idx] = video_idx
+                save_config()
+                threading.Thread(target=crossfade_monitor, args=(monitor_idx, video_idx), daemon=True).start()
+        except Exception as e:
+            state.log(f"Error changing monitor video: {e}", "ERROR")
 
     def test_transition(self):
-        if len(state.videos) < 2:
-            QMessageBox.warning(self, "Need More Videos", "Add at least 2 videos to test transitions")
-            return
-        new_idx = (state.current_index + 1) % len(state.videos)
-        threading.Thread(target=crossfade_monitor, args=(0, new_idx), daemon=True).start()
+        """Test transition effect"""
+        try:
+            if len(state.videos) < 2:
+                QMessageBox.warning(
+                    self, 
+                    "Need More Videos", 
+                    "Add at least 2 videos to test transitions"
+                )
+                return
+                
+            new_idx = (state.current_index + 1) % len(state.videos)
+            threading.Thread(target=crossfade_monitor, args=(0, new_idx), daemon=True).start()
+                
+        except Exception as e:
+            state.log(f"Error testing transition: {e}", "ERROR")
 
+# ==================== MAIN WINDOW ====================
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Video Wallpaper Manager")
-        self.resize(900, 700)
+        self.resize(900, 750)
+        
+        self.setup_icon()
+        
         load_config()
         detect_monitors()
         load_videos()
-        tabs = QTabWidget()
-        tabs.addTab(LibraryTab(self), "📁 Library")
-        tabs.addTab(MoeWallsTab(self), "🌐 MoeWalls")
-        tabs.addTab(DisplayTab(self), "🖥 Display")
-        self.setCentralWidget(tabs)
+        
+        state.process_monitor = ProcessMonitorThread()
+        state.process_monitor.start()
+        
+        state.auto_change_thread = AutoChangeThread()
+        state.auto_change_thread.start()
+        
+        self.tabs = QTabWidget()
+        self.tabs.addTab(LibraryTab(self), "📁 Library")
+        self.tabs.addTab(MoeWallsTab(self), "🌐 MoeWalls")
+        self.tabs.addTab(DisplayTab(self), "🖥 Display")
+        self.tabs.addTab(SettingsTab(self), "⚙️ Settings")
+        self.setCentralWidget(self.tabs)
 
-        # Visualizer Init
-        self.visualizer_window = None
-        self.audio_engine = None
-        if state.visualizer_enabled and AUDIO_VIS_AVAILABLE:
-            self.toggle_visualizer(True)
+        self.setup_tray()
+        QTimer.singleShot(1000, self.check_mpv)
 
-        # Keyboard Shortcuts Init
-        self.keyboard_handler = KeyboardHandler()
-        self.keyboard_handler.next_signal.connect(next_wallpaper)
-        self.keyboard_handler.prev_signal.connect(prev_wallpaper)
-        self.keyboard_handler.random_signal.connect(random_wallpaper)
-        self.keyboard_handler.toggle_signal.connect(self.toggle_visualizer_tray)
-        if state.shortcuts_enabled and PYNPUT_AVAILABLE:
-            if self.keyboard_handler.start():
-                state.log("Keyboard shortcuts enabled")
-            else:
-                state.log("Failed to start keyboard shortcuts")
-        else:
-            if not PYNPUT_AVAILABLE:
-                state.log("pynput not available - keyboard shortcuts disabled")
+    def setup_icon(self):
+        """Setup window icon"""
+        try:
+            icon = QIcon()
+            
+            icon_paths = [
+                os.path.join(os.path.dirname(sys.executable), 'icon.ico'),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico'),
+                os.path.join(os.getcwd(), 'icon.ico'),
+            ]
+            
+            for icon_path in icon_paths:
+                if os.path.exists(icon_path):
+                    icon = QIcon(icon_path)
+                    break
+            
+            if icon.isNull():
+                pixmap = QPixmap(64, 64)
+                pixmap.fill(QColor('#00d4aa'))
+                icon = QIcon(pixmap)
+            
+            self.setWindowIcon(icon)
+            
+        except Exception as e:
+            state.log(f"Error setting up icon: {e}", "ERROR")
 
-        # System Tray
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
-        tray_menu = QMenu()
-        next_action = QAction("Next Wallpaper", self)
-        next_action.triggered.connect(next_wallpaper)
-        tray_menu.addAction(next_action)
-        prev_action = QAction("Previous Wallpaper", self)
-        prev_action.triggered.connect(prev_wallpaper)
-        tray_menu.addAction(prev_action)
-        random_action = QAction("Random Wallpaper", self)
-        random_action.triggered.connect(random_wallpaper)
-        tray_menu.addAction(random_action)
-        tray_menu.addSeparator()
-        self.vis_tray_action = QAction("Visualizer: ON" if state.visualizer_enabled else "Visualizer: OFF", self)
-        self.vis_tray_action.triggered.connect(self.toggle_visualizer_tray)
-        tray_menu.addAction(self.vis_tray_action)
-        tray_menu.addSeparator()
-        stop_action = QAction("Stop Wallpapers", self)
-        stop_action.triggered.connect(stop_wallpapers)
-        tray_menu.addAction(stop_action)
-        tray_menu.addSeparator()
-        show_action = QAction("Show Window", self)
-        show_action.triggered.connect(self.show)
-        show_action.triggered.connect(self.activateWindow)
-        tray_menu.addAction(show_action)
-        quit_action = QAction("Quit", self)
-        quit_action.triggered.connect(QApplication.instance().quit)
-        tray_menu.addAction(quit_action)
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.show()
+    def setup_tray(self):
+        """Setup system tray icon and menu"""
+        try:
+            self.tray_icon = QSystemTrayIcon(self)
+            self.tray_icon.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon))
+            
+            tray_menu = QMenu()
+            
+            next_action = QAction("Next Wallpaper", self)
+            next_action.triggered.connect(next_wallpaper)
+            tray_menu.addAction(next_action)
+            
+            prev_action = QAction("Previous Wallpaper", self)
+            prev_action.triggered.connect(prev_wallpaper)
+            tray_menu.addAction(prev_action)
+            
+            random_action = QAction("Random Wallpaper", self)
+            random_action.triggered.connect(random_wallpaper)
+            tray_menu.addAction(random_action)
+            
+            tray_menu.addSeparator()
+            
+            stop_action = QAction("Stop Wallpapers", self)
+            stop_action.triggered.connect(stop_wallpapers)
+            tray_menu.addAction(stop_action)
+            
+            tray_menu.addSeparator()
+            
+            show_action = QAction("Show Window", self)
+            show_action.triggered.connect(self.show)
+            show_action.triggered.connect(self.activateWindow)
+            tray_menu.addAction(show_action)
+            
+            hide_action = QAction("Hide to Tray", self)
+            hide_action.triggered.connect(self.hide)
+            tray_menu.addAction(hide_action)
+            
+            tray_menu.addSeparator()
+            
+            quit_action = QAction("Quit", self)
+            quit_action.triggered.connect(self.quit_application)
+            tray_menu.addAction(quit_action)
+            
+            self.tray_icon.setContextMenu(tray_menu)
+            self.tray_icon.show()
+            
+        except Exception as e:
+            state.log(f"Error setting up tray: {e}", "ERROR")
 
-    def toggle_visualizer_tray(self):
-        is_enabled = not state.visualizer_enabled
-        state.visualizer_enabled = is_enabled
-        save_config()
-        self.toggle_visualizer(is_enabled)
-        self.vis_tray_action.setText("Visualizer: ON" if is_enabled else "Visualizer: OFF")
+    def check_mpv(self):
+        """Check if mpv is available"""
+        try:
+            if not find_mpv():
+                QMessageBox.warning(
+                    self,
+                    "MPV Not Found",
+                    "MPV player is not installed or not in PATH.\n\n"
+                    "Please install mpv to use this application.\n"
+                    "Download from: https://mpv.io/installation/"
+                )
+        except Exception as e:
+            state.log(f"Error checking mpv: {e}", "ERROR")
 
-    def toggle_visualizer(self, enabled):
-        if not AUDIO_VIS_AVAILABLE:
-            return
-        if enabled:
-            if not self.visualizer_window:
-                self.visualizer_window = AudioVisualizerWindow(theme_engine)
-                self.visualizer_window.show()
-            if not self.audio_engine:
-                self.audio_engine = AudioEngine()
-                self.audio_engine.bars = state.visualizer_bars
-                self.audio_engine.data_ready.connect(self.visualizer_window.update_data)
-                self.audio_engine.start()
-        else:
-            if self.audio_engine:
-                self.audio_engine.stop()
-                self.audio_engine = None
-            if self.visualizer_window:
-                self.visualizer_window.close()
-                self.visualizer_window = None
+    def quit_application(self):
+        """Clean quit application"""
+        try:
+            state.log("Quitting application...")
+            
+            if state.auto_change_thread:
+                state.auto_change_thread.stop()
+                state.auto_change_thread.wait(2000)
+            
+            cleanup_handler()
+            
+            QApplication.quit()
+            
+        except Exception as e:
+            state.log(f"Error during quit: {e}", "ERROR")
+            QApplication.quit()
 
     def closeEvent(self, event):
-        if hasattr(self, 'keyboard_handler') and self.keyboard_handler:
-            self.keyboard_handler.stop()
-        event.ignore()
-        self.hide()
-
-    def refresh_library(self):
-        central = self.centralWidget()
-        if isinstance(central, QTabWidget):
-            lib_tab = central.widget(0)
-            if hasattr(lib_tab, 'refresh_library'):
-                lib_tab.refresh_library()
+        """Override close event to hide to tray"""
+        try:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "Video Wallpaper Manager",
+                "Application minimized to system tray",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+        except Exception as e:
+            state.log(f"Error in close event: {e}", "ERROR")
 
     def apply_theme(self, theme_name):
-        if theme_engine:
-            theme_engine.set_theme(theme_name)
+        """Apply theme"""
+        try:
+            if theme_name == "Dark":
+                self.setStyleSheet("""
+                    QMainWindow { background-color: #1e1e1e; color: #ffffff; }
+                    QGroupBox { color: #00d4aa; border: 1px solid #3d3d3d; }
+                    QPushButton { background-color: #2d2d2d; color: #ffffff; border: 1px solid #3d3d3d; padding: 8px; border-radius: 4px; }
+                    QPushButton:hover { background-color: #3d3d3d; }
+                """)
+            elif theme_name == "Light":
+                self.setStyleSheet("""
+                    QMainWindow { background-color: #f0f0f0; color: #000000; }
+                    QGroupBox { color: #0078d4; border: 1px solid #d0d0d0; }
+                    QPushButton { background-color: #ffffff; color: #000000; border: 1px solid #d0d0d0; padding: 8px; border-radius: 4px; }
+                    QPushButton:hover { background-color: #e0e0e0; }
+                """)
+            elif theme_name == "Dracula":
+                self.setStyleSheet("""
+                    QMainWindow { background-color: #282a36; color: #f8f8f2; }
+                    QGroupBox { color: #bd93f9; border: 1px solid #6272a4; }
+                    QPushButton { background-color: #44475a; color: #f8f8f2; border: 1px solid #6272a4; padding: 8px; border-radius: 4px; }
+                    QPushButton:hover { background-color: #6272a4; }
+                """)
+            elif theme_name == "Nord":
+                self.setStyleSheet("""
+                    QMainWindow { background-color: #2e3440; color: #eceff4; }
+                    QGroupBox { color: #88c0d0; border: 1px solid #4c566a; }
+                    QPushButton { background-color: #3b4252; color: #eceff4; border: 1px solid #4c566a; padding: 8px; border-radius: 4px; }
+                    QPushButton:hover { background-color: #434c5e; }
+                """)
+            elif theme_name == "Midnight":
+                self.setStyleSheet("""
+                    QMainWindow { background-color: #0a0a0a; color: #e0e0e0; }
+                    QGroupBox { color: #bb86fc; border: 1px solid #2e2e2e; }
+                    QPushButton { background-color: #1e1e1e; color: #e0e0e0; border: 1px solid #2e2e2e; padding: 8px; border-radius: 4px; }
+                    QPushButton:hover { background-color: #2e2e2e; }
+                """)
+        except Exception as e:
+            state.log(f"Error applying theme: {e}", "ERROR")
 
+# ==================== MAIN ====================
 if __name__ == "__main__":
-    # Get the correct path for both script and exe
-    if getattr(sys, 'frozen', False):
-        # Running as compiled executable
-        application_path = os.path.dirname(sys.executable)
-        # Set a more specific AppUserModelID
-        myappid = 'VideoWallpaperManager.MainApp.1.0'
-    else:
-        # Running as script
-        application_path = os.path.dirname(os.path.abspath(__file__))
-        myappid = 'com.videowallpaper.app.script.1.0'
-    
-    # Set Windows App User Model ID (important for taskbar icon)
     try:
+        if getattr(sys, 'frozen', False):
+            myappid = 'VideoWallpaperManager.MainApp.2.2'
+        else:
+            myappid = 'com.videowallpaper.app.script.2.2'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception as e:
         print(f"Failed to set AppUserModelID: {e}")
 
     app = QApplication(sys.argv)
-
-    # Load icon with multiple fallback methods
-    icon = QIcon()
     
-    # Try loading from various possible locations
-    icon_paths = [
-        os.path.join(application_path, 'icon.ico'),
-        os.path.join(application_path, 'resources', 'icon.ico'),
-        os.path.join(os.path.dirname(application_path), 'icon.ico'),
-        os.path.join(os.getcwd(), 'icon.ico'),
-    ]
+    app.setApplicationName("Video Wallpaper Manager")
+    app.setApplicationVersion("2.2")
+    app.setOrganizationName("VideoWallpaper")
     
-    for icon_path in icon_paths:
-        if os.path.exists(icon_path):
-            icon = QIcon(icon_path)
-            app.setWindowIcon(icon)
-            print(f"Loaded icon from: {icon_path}")
-            break
-    
-    # If no icon found, create a default one
-    if icon.isNull():
-        print("No icon file found, using default icon")
-        # Create a simple colored icon as fallback
-        pixmap = QPixmap(64, 64)
-        pixmap.fill(QColor('#00d4aa'))
-        icon = QIcon(pixmap)
-        app.setWindowIcon(icon)
-
-    # Initialize Theme Engine
-    theme_engine = ThemeManager(app)
-    theme_engine.set_theme(state.theme)
-
-    window = MainWindow()
-    if not icon.isNull():
-        window.setWindowIcon(icon)
-    window.show()
-    
-    sys.exit(app.exec())
+    try:
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
