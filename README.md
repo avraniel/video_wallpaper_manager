@@ -124,4 +124,4 @@ MPV for the video playback engine
 
 Made with ❤️ by Raniel
 
-buymeacoffee.com/avraniel                
+https://buymeacoffee.com/avraniel                
