@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Video Wallpaper Manager - Complete Fixed Version
+Video Wallpaper Manager - Complete Version with Format Selection
+- Choose between MP4 (smaller) and WebM (better quality)
+- Fixed MoeWalls download links
 - Fixed auto-change timer
 - Fixed tab references
-- Added proper thread-safe signals
-- Improved logging and debugging
+- Added manual download option
+- Improved error handling
 """
 import sys
 import os
@@ -20,9 +22,10 @@ import atexit
 import signal
 import psutil
 import shutil
+import webbrowser
 from datetime import datetime
 from collections import deque
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 from io import BytesIO
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -51,7 +54,8 @@ def load_settings():
     default_settings = {
         "video_path": DEFAULT_VIDEO_PATH,
         "library_paths": [],
-        "check_subfolders": False
+        "check_subfolders": False,
+        "preferred_format": "mp4"  # Default format
     }
     
     if os.path.exists(SETTINGS_FILE):
@@ -120,11 +124,12 @@ DEFAULT_SETTINGS = {
     "transition_duration": 1.2,
     "transition_fps": 60,
     "auto_change_enabled": False,
-    "auto_change_interval": 300,  # seconds
+    "auto_change_interval": 300,
     "monitor_assignments": {},
     "theme": "Dark",
     "accent_color": "#00d4aa",
-    "library_paths": []
+    "library_paths": [],
+    "preferred_format": "mp4"
 }
 
 # Windows constants
@@ -164,6 +169,7 @@ class AppState:
         self.settings_tab = None
         self.library_tab = None
         self.auto_change_thread = None
+        self.preferred_format = "mp4"
 
     def log(self, message, level="INFO"):
         if self.shutting_down:
@@ -384,6 +390,9 @@ def load_config():
                     if os.path.exists(path) and os.path.isdir(path):
                         state.library_paths.add(path)
             
+            if 'preferred_format' in config:
+                state.preferred_format = config['preferred_format']
+            
             state.log("Configuration loaded")
             
         except Exception as e:
@@ -404,7 +413,8 @@ def save_config():
         'auto_change_enabled': state.auto_change_enabled,
         'auto_change_interval': state.auto_change_interval,
         'theme': state.theme,
-        'library_paths': list(state.library_paths)
+        'library_paths': list(state.library_paths),
+        'preferred_format': state.preferred_format
     }
     
     temp_file = CONFIG_FILE + ".tmp"
@@ -630,10 +640,10 @@ class ProcessMonitorThread(QThread):
         self.running = False
         state.process_monitor_running = False
 
-# ==================== AUTO-CHANGE TIMER (FIXED) ====================
+# ==================== AUTO-CHANGE TIMER ====================
 class AutoChangeThread(QThread):
     """Thread for auto-changing wallpapers"""
-    change_signal = pyqtSignal()  # Signal to trigger wallpaper change in main thread
+    change_signal = pyqtSignal()
     
     def __init__(self):
         super().__init__()
@@ -657,19 +667,16 @@ class AutoChangeThread(QThread):
                     minutes = interval // 60
                     state.log(f"Auto-change: Next change in {minutes} minute(s)")
                     
-                    # Sleep in 1-second increments to allow quick response to changes
                     for i in range(interval):
                         if not self.running or state.shutting_down or not state.auto_change_enabled:
                             break
                         time.sleep(1)
                         
-                        # Log every minute for debugging
                         if i > 0 and i % 60 == 0:
                             remaining = (interval - i) // 60
                             if remaining > 0:
                                 state.log(f"Auto-change: {remaining} minute(s) remaining")
                     
-                    # Check if we should change
                     if (self.running and not state.shutting_down and 
                         state.auto_change_enabled and len(state.videos) > 1):
                         self.change_signal.emit()
@@ -1292,7 +1299,6 @@ def random_wallpaper():
     
     with state.lock:
         new_index = random.randint(0, len(state.videos) - 1)
-        # Make sure we don't select the same video
         while len(state.videos) > 1 and new_index == state.current_index:
             new_index = random.randint(0, len(state.videos) - 1)
             
@@ -1311,7 +1317,292 @@ def random_wallpaper():
         else:
             QTimer.singleShot(0, lambda: start_wallpaper(state.videos[new_index]))
 
-# ==================== MOEWALLS SCRAPER ====================
+# ==================== MOEWALLS SCRAPER WITH FORMAT SELECTION ====================
+def extract_video_urls(page_url):
+    """Extract all video URLs from the page (both MP4 and WebM)"""
+    if not page_url:
+        return [], []
+    
+    state.log(f"Extracting video URLs from: {page_url}")
+    
+    mp4_urls = []
+    webm_urls = []
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+            r = requests.get(page_url, headers=headers, timeout=15)
+            r.raise_for_status()
+            
+            soup = BeautifulSoup(r.text, "html.parser")
+            
+            # Method 1: Look for video source in video tags
+            for video in soup.find_all("video"):
+                for source in video.find_all("source", src=True):
+                    src = source.get('src', '')
+                    if src:
+                        if src.startswith('http'):
+                            full_url = src
+                        else:
+                            full_url = urljoin(page_url, src)
+                        
+                        if '.mp4' in src.lower():
+                            mp4_urls.append(full_url)
+                        elif '.webm' in src.lower():
+                            webm_urls.append(full_url)
+            
+            # Method 2: Look for direct video links in the page
+            for a in soup.find_all("a", href=True):
+                href = a.get('href', '')
+                if href:
+                    if href.startswith('http'):
+                        full_url = href
+                    else:
+                        full_url = urljoin(page_url, href)
+                    
+                    if '.mp4' in href.lower():
+                        mp4_urls.append(full_url)
+                    elif '.webm' in href.lower():
+                        webm_urls.append(full_url)
+            
+            # Method 3: Look for resolution page links and follow them
+            resolution_links = []
+            for a in soup.find_all("a", href=True):
+                href = a.get('href', '')
+                text = a.text.lower()
+                if 'resolution' in href.lower() or any(res in text for res in ['4k', '1080p', '2160p', '1440p']):
+                    if href.startswith('http'):
+                        resolution_links.append(href)
+                    else:
+                        resolution_links.append(urljoin(page_url, href))
+            
+            # Check resolution pages for videos
+            if resolution_links:
+                state.log(f"Found {len(resolution_links)} resolution pages, checking for videos...")
+                for res_link in resolution_links[:3]:
+                    res_mp4, res_webm = extract_video_from_resolution_page(res_link)
+                    mp4_urls.extend(res_mp4)
+                    webm_urls.extend(res_webm)
+            
+            # Remove duplicates while preserving order
+            mp4_urls = list(dict.fromkeys(mp4_urls))
+            webm_urls = list(dict.fromkeys(webm_urls))
+            
+            state.log(f"Found {len(mp4_urls)} MP4 and {len(webm_urls)} WebM links")
+            return mp4_urls, webm_urls
+            
+        except Exception as e:
+            state.log(f"Error extracting video URLs (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                return [], []
+
+def extract_video_from_resolution_page(resolution_url):
+    """Extract video URLs from a resolution page"""
+    mp4_urls = []
+    webm_urls = []
+    
+    try:
+        state.log(f"Checking resolution page: {resolution_url}")
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        r = requests.get(resolution_url, headers=headers, timeout=10)
+        r.raise_for_status()
+        
+        soup = BeautifulSoup(r.text, "html.parser")
+        
+        # Look for video sources
+        for video in soup.find_all("video"):
+            for source in video.find_all("source", src=True):
+                src = source.get('src', '')
+                if src:
+                    if src.startswith('http'):
+                        full_url = src
+                    else:
+                        full_url = urljoin(resolution_url, src)
+                    
+                    if '.mp4' in src.lower():
+                        mp4_urls.append(full_url)
+                    elif '.webm' in src.lower():
+                        webm_urls.append(full_url)
+        
+        # Look for direct download links
+        for a in soup.find_all("a", href=True):
+            href = a.get('href', '')
+            if href:
+                if href.startswith('http'):
+                    full_url = href
+                else:
+                    full_url = urljoin(resolution_url, href)
+                
+                if '.mp4' in href.lower():
+                    mp4_urls.append(full_url)
+                elif '.webm' in href.lower():
+                    webm_urls.append(full_url)
+        
+        return mp4_urls, webm_urls
+        
+    except Exception as e:
+        state.log(f"Error extracting from resolution page: {e}", "DEBUG")
+        return [], []
+
+def download_wallpaper(wallpaper_data, preferred_format='mp4', progress_callback=None):
+    """Download wallpaper with format selection"""
+    page_url = wallpaper_data.get("page")
+    if not page_url:
+        raise ValueError("No page URL provided")
+    
+    state.log(f"Processing wallpaper: {wallpaper_data.get('title', 'Unknown')} (preferred format: {preferred_format})")
+    
+    # Get all available video URLs
+    mp4_urls, webm_urls = extract_video_urls(page_url)
+    
+    # Select URL based on preference
+    video_url = None
+    actual_format = None
+    
+    if preferred_format.lower() == 'mp4' and mp4_urls:
+        video_url = mp4_urls[0]
+        actual_format = 'mp4'
+        state.log(f"Found {len(mp4_urls)} MP4 links, using first one")
+    elif preferred_format.lower() == 'webm' and webm_urls:
+        video_url = webm_urls[0]
+        actual_format = 'webm'
+        state.log(f"Found {len(webm_urls)} WebM links, using first one")
+    elif mp4_urls:
+        video_url = mp4_urls[0]
+        actual_format = 'mp4'
+        state.log(f"Preferred format not available, falling back to MP4")
+    elif webm_urls:
+        video_url = webm_urls[0]
+        actual_format = 'webm'
+        state.log(f"Preferred format not available, falling back to WebM")
+    
+    if not video_url:
+        # Try resolution pages directly as last resort
+        if 'resolution' in page_url.lower():
+            res_mp4, res_webm = extract_video_from_resolution_page(page_url)
+            if preferred_format.lower() == 'mp4' and res_mp4:
+                video_url = res_mp4[0]
+                actual_format = 'mp4'
+            elif preferred_format.lower() == 'webm' and res_webm:
+                video_url = res_webm[0]
+                actual_format = 'webm'
+            elif res_mp4:
+                video_url = res_mp4[0]
+                actual_format = 'mp4'
+            elif res_webm:
+                video_url = res_webm[0]
+                actual_format = 'webm'
+    
+    if not video_url:
+        raise Exception("Could not find any video URL on the page")
+    
+    state.log(f"Downloading {actual_format.upper()} video from: {video_url}")
+    
+    # Generate filename
+    filename = video_url.split("/")[-1].split("?")[0]
+    if not filename or '.' not in filename:
+        safe_title = "".join(c for c in wallpaper_data.get('title', 'wallpaper') if c.isalnum() or c in ' ._-')[:50]
+        filename = f"{safe_title}.{actual_format}".replace(' ', '_')
+    elif not filename.lower().endswith((f'.{actual_format}', '.mp4', '.webm')):
+        base = os.path.splitext(filename)[0]
+        filename = f"{base}.{actual_format}"
+    
+    filepath = os.path.join(state.save_dir, filename)
+    
+    # Handle duplicates
+    if os.path.exists(filepath):
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while os.path.exists(filepath):
+            new_filename = f"{base}_{counter}{ext}"
+            filepath = os.path.join(state.save_dir, new_filename)
+            counter += 1
+    
+    temp_path = filepath + ".tmp"
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": f"video/{actual_format},video/*;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://moewalls.com/",
+    }
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(video_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+            r.raise_for_status()
+            
+            content_type = r.headers.get('content-type', '')
+            if 'text/html' in content_type:
+                if attempt < MAX_RETRIES - 1:
+                    state.log(f"Got HTML instead of video, retrying... (attempt {attempt + 1})", "WARNING")
+                    time.sleep(RETRY_DELAY)
+                    continue
+                else:
+                    raise Exception("Server returned HTML instead of video")
+            
+            total = int(r.headers.get('content-length', 0))
+            downloaded = 0
+            last_progress = 0
+            
+            with open(temp_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_callback and total > 0:
+                            progress = int(downloaded * 100 / total)
+                            if progress != last_progress:
+                                progress_callback(progress)
+                                last_progress = progress
+            
+            if os.path.getsize(temp_path) == 0:
+                raise Exception("Downloaded file is empty")
+            
+            os.rename(temp_path, filepath)
+            state.log(f"Download complete: {os.path.basename(filepath)}")
+            return filepath
+            
+        except requests.Timeout:
+            state.log(f"Download timeout (attempt {attempt + 1})", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except:
+                    pass
+            else:
+                raise Exception("Download timed out after multiple attempts")
+                
+        except requests.RequestException as e:
+            state.log(f"Download error (attempt {attempt + 1}): {e}", "WARNING")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+                try:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                except:
+                    pass
+            else:
+                raise Exception(f"Download failed: {e}")
+                
+        except Exception as e:
+            state.log(f"Unexpected error: {e}", "ERROR")
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except:
+                pass
+            if attempt == MAX_RETRIES - 1:
+                raise Exception(f"Download failed: {e}")
+
 def search_wallpapers(keyword):
     """Search MoeWalls for wallpapers"""
     if not keyword or not keyword.strip():
@@ -1361,107 +1652,6 @@ def search_wallpapers(keyword):
             else:
                 raise Exception(f"Search failed: {e}")
 
-def get_download_link(page_url):
-    """Get download link from page"""
-    if not page_url:
-        return None
-        
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = requests.get(page_url, headers=HEADERS, timeout=10)
-            r.raise_for_status()
-            
-            soup = BeautifulSoup(r.text, "html.parser")
-            for a in soup.find_all("a"):
-                try:
-                    if a.get('href') and "download" in a.text.lower():
-                        return a["href"]
-                except Exception:
-                    continue
-                    
-            return None
-            
-        except requests.Timeout:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-            else:
-                return None
-        except requests.RequestException:
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-            else:
-                return None
-
-def download_video(url, progress_callback=None):
-    """Download video with progress"""
-    if not url:
-        raise ValueError("No URL provided")
-        
-    filename = url.split("/")[-1].split("?")[0]
-    if not filename.lower().endswith(VIDEO_EXTENSIONS):
-        filename += ".mp4"
-        
-    filepath = os.path.join(state.save_dir, filename)
-    
-    if os.path.exists(filepath):
-        base, ext = os.path.splitext(filename)
-        counter = 1
-        while os.path.exists(filepath):
-            filepath = os.path.join(state.save_dir, f"{base}_{counter}{ext}")
-            counter += 1
-    
-    temp_path = filepath + ".tmp"
-    
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = requests.get(url, headers=HEADERS, stream=True, timeout=30)
-            r.raise_for_status()
-            
-            total = int(r.headers.get('content-length', 0))
-            downloaded = 0
-            
-            with open(temp_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        if progress_callback and total > 0:
-                            progress_callback(int(downloaded * 100 / total))
-            
-            os.rename(temp_path, filepath)
-            return filepath
-            
-        except requests.Timeout as e:
-            state.log(f"Download timeout (attempt {attempt + 1}): {e}", "WARNING")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except Exception:
-                    pass
-            else:
-                raise Exception("Download timed out after multiple attempts")
-        except requests.RequestException as e:
-            state.log(f"Download error (attempt {attempt + 1}): {e}", "WARNING")
-            if attempt < MAX_RETRIES - 1:
-                time.sleep(RETRY_DELAY)
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                except Exception:
-                    pass
-            else:
-                raise Exception(f"Download failed: {e}")
-        except (IOError, OSError) as e:
-            state.log(f"File error during download: {e}", "ERROR")
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except Exception:
-                pass
-            raise Exception(f"File error: {e}")
-
 # ==================== WORKER THREADS ====================
 class SearchThread(QThread):
     finished = pyqtSignal(list)
@@ -1483,22 +1673,21 @@ class DownloadThread(QThread):
     finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, page_url):
+    def __init__(self, wallpaper_data, preferred_format='mp4'):
         super().__init__()
-        self.page_url = page_url
+        self.wallpaper_data = wallpaper_data
+        self.preferred_format = preferred_format
 
     def run(self):
         try:
-            dl_url = get_download_link(self.page_url)
-            if not dl_url:
-                self.error.emit("Download link not found")
-                return
-                
-            filepath = download_video(dl_url, lambda p: self.progress.emit(p))
+            state.log(f"Processing wallpaper: {self.wallpaper_data.get('title', 'Unknown')} (format: {self.preferred_format})")
+            filepath = download_wallpaper(self.wallpaper_data, self.preferred_format, lambda p: self.progress.emit(p))
             self.finished.emit(filepath)
             
         except Exception as e:
-            self.error.emit(str(e))
+            error_msg = str(e)
+            state.log(f"Download error: {error_msg}", "ERROR")
+            self.error.emit(error_msg)
 
 # ==================== GUI COMPONENTS ====================
 class WallpaperCard(QFrame):
@@ -1533,6 +1722,10 @@ class WallpaperCard(QFrame):
                 font = self.thumb_label.font()
                 font.setPointSize(32)
                 self.thumb_label.setFont(font)
+                
+                # Show file format for local files
+                ext = os.path.splitext(self.video_path)[1].upper()
+                self.setToolTip(f"Format: {ext}")
             else:
                 self.thumb_label.setText("⬇")
                 font = self.thumb_label.font()
@@ -1573,6 +1766,12 @@ class WallpaperCard(QFrame):
                 dl_btn.clicked.connect(lambda: self.download_clicked.emit(self.online_data))
                 dl_btn.setCursor(Qt.CursorShape.PointingHandCursor)
                 btn_layout.addWidget(dl_btn)
+                
+                manual_btn = QPushButton("🌐 Open")
+                manual_btn.clicked.connect(lambda: webbrowser.open(self.online_data["page"]))
+                manual_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                manual_btn.setMaximumWidth(60)
+                btn_layout.addWidget(manual_btn)
             
             layout.addLayout(btn_layout)
             
@@ -1634,7 +1833,6 @@ class SettingsTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(20)
         
-        # Video Storage Location
         storage_box = QGroupBox("Video Storage Location")
         storage_layout = QVBoxLayout(storage_box)
         
@@ -1659,7 +1857,6 @@ class SettingsTab(QWidget):
         
         layout.addWidget(storage_box)
         
-        # Additional Library Paths
         paths_box = QGroupBox("Additional Library Folders")
         paths_layout = QVBoxLayout(paths_box)
         
@@ -1687,7 +1884,6 @@ class SettingsTab(QWidget):
         
         layout.addWidget(paths_box)
         
-        # Library Statistics
         stats_box = QGroupBox("Library Statistics")
         stats_layout = QVBoxLayout(stats_box)
         
@@ -1701,15 +1897,14 @@ class SettingsTab(QWidget):
         
         layout.addWidget(stats_box)
         
-               
-        # About
         about_box = QGroupBox("About")
         about_layout = QVBoxLayout(about_box)
         
         about_text = QLabel(
-            "Video Wallpaper Manager v2.2\n"
+            "Video Wallpaper Manager v2.3\n"
             "Configurable storage location\n"
             "Supports multiple library folders\n"
+            "MP4/WebM format selection\n"
             "MPV player required"
         )
         about_layout.addWidget(about_text)
@@ -1732,10 +1927,20 @@ class SettingsTab(QWidget):
         """Update library statistics"""
         total_size = 0
         video_count = len(state.videos)
+        mp4_count = 0
+        webm_count = 0
+        other_count = 0
         
         for video in state.videos:
             try:
                 total_size += os.path.getsize(video)
+                ext = os.path.splitext(video)[1].lower()
+                if ext == '.mp4':
+                    mp4_count += 1
+                elif ext == '.webm':
+                    webm_count += 1
+                else:
+                    other_count += 1
             except:
                 pass
         
@@ -1748,23 +1953,15 @@ class SettingsTab(QWidget):
         
         stats_text = (
             f"Total videos: {video_count}\n"
+            f"  MP4: {mp4_count}\n"
+            f"  WebM: {webm_count}\n"
+            f"  Other: {other_count}\n"
             f"Total size: {size_str}\n"
             f"Main folder: {state.save_dir}\n"
             f"Additional folders: {len(state.library_paths)}"
         )
         
         self.stats_label.setText(stats_text)
-    
-    def debug_auto_change(self):
-        """Debug auto-change settings"""
-        debug_msg = (
-            f"Auto-change enabled: {state.auto_change_enabled}\n"
-            f"Interval (seconds): {state.auto_change_interval}\n"
-            f"Interval (minutes): {state.auto_change_interval // 60}\n"
-            f"Videos count: {len(state.videos)}\n"
-            f"Thread running: {state.auto_change_thread.isRunning() if state.auto_change_thread else False}"
-        )
-        QMessageBox.information(self, "Auto-Change Debug", debug_msg)
     
     def change_location(self):
         """Change video storage location"""
@@ -1856,6 +2053,7 @@ class MoeWallsTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(15)
         
+        # Search row
         search_layout = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search anime wallpapers...")
@@ -1868,6 +2066,24 @@ class MoeWallsTab(QWidget):
         search_layout.addWidget(self.search_btn)
         
         layout.addLayout(search_layout)
+        
+        # Format selection row
+        format_layout = QHBoxLayout()
+        format_layout.addWidget(QLabel("Preferred format:"))
+        
+        self.format_combo = QComboBox()
+        self.format_combo.addItems(["MP4 (Smaller file)", "WebM (Better quality)"])
+        self.format_combo.setCurrentIndex(0)
+        self.format_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        format_layout.addWidget(self.format_combo)
+        
+        format_layout.addStretch()
+        
+        format_info = QLabel("MP4: Smaller size | WebM: Better quality")
+        format_info.setStyleSheet("color: #888; font-size: 9pt;")
+        format_layout.addWidget(format_info)
+        
+        layout.addLayout(format_layout)
         
         self.progress = QProgressBar()
         self.progress.setVisible(False)
@@ -1889,6 +2105,10 @@ class MoeWallsTab(QWidget):
         self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.status_label.setStyleSheet("color: #888; padding: 20px;")
         layout.addWidget(self.status_label)
+
+    def get_preferred_format(self):
+        """Get the preferred format from combo box"""
+        return 'mp4' if self.format_combo.currentIndex() == 0 else 'webm'
 
     def do_search(self):
         keyword = self.search_input.text().strip()
@@ -1946,7 +2166,8 @@ class MoeWallsTab(QWidget):
             self.download_thread.terminate()
             self.download_thread.wait()
         
-        self.download_thread = DownloadThread(data["page"])
+        preferred_format = self.get_preferred_format()
+        self.download_thread = DownloadThread(data, preferred_format)
         self.download_thread.progress.connect(self.progress.setValue)
         self.download_thread.finished.connect(self.on_download_finished)
         self.download_thread.error.connect(self.on_download_error)
@@ -1967,7 +2188,28 @@ class MoeWallsTab(QWidget):
 
     def on_download_error(self, error):
         self.progress.setVisible(False)
-        QMessageBox.warning(self, "Download Error", str(error))
+        preferred_format = self.get_preferred_format()
+        
+        reply = QMessageBox.question(
+            self,
+            "Download Failed",
+            f"Failed to download {preferred_format.upper()} format: {error}\n\n"
+            f"Do you want to try the other format or open the page in browser?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            # Try the other format
+            other_format = 'webm' if preferred_format == 'mp4' else 'mp4'
+            self.download_thread = DownloadThread(self.download_thread.wallpaper_data, other_format)
+            self.download_thread.progress.connect(self.progress.setValue)
+            self.download_thread.finished.connect(self.on_download_finished)
+            self.download_thread.error.connect(self.on_download_error)
+            self.download_thread.start()
+            self.progress.setVisible(True)
+            
+        elif reply == QMessageBox.StandardButton.No:
+            webbrowser.open(self.download_thread.wallpaper_data["page"])
 
 class LibraryTab(QWidget):
     def __init__(self, parent=None):
@@ -2610,9 +2852,9 @@ class MainWindow(QMainWindow):
 if __name__ == "__main__":
     try:
         if getattr(sys, 'frozen', False):
-            myappid = 'VideoWallpaperManager.MainApp.2.2'
+            myappid = 'VideoWallpaperManager.MainApp.2.3'
         else:
-            myappid = 'com.videowallpaper.app.script.2.2'
+            myappid = 'com.videowallpaper.app.script.2.3'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception as e:
         print(f"Failed to set AppUserModelID: {e}")
@@ -2620,7 +2862,7 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     app.setApplicationName("Video Wallpaper Manager")
-    app.setApplicationVersion("2.2")
+    app.setApplicationVersion("2.3")
     app.setOrganizationName("VideoWallpaper")
     
     try:
