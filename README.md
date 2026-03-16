@@ -118,8 +118,14 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 This project is licensed under the MIT License - see the LICENSE file for details.
 
 🙏 Acknowledgments
-MoeWalls for the wallpaper source
-MPV for the video playback engine
+
+MPV Player - Video playback
+
+MoeWalls - Wallpaper source
+
+PyInstaller - EXE building
+
+UPX - Executable compression
 
 
 Made with ❤️ by Raniel
